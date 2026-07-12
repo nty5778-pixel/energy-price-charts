@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
@@ -279,6 +278,7 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
         raise HTTPException(status_code=404, detail=f"No rows found for {month}.")
 
     dates = [row.price_date for row in rows]
+    x_values = list(range(len(rows)))
     nymex = [row.nymex_price for row in rows]
     katy = [row.katy_price for row in rows]
     hsc = [row.hsc_monthly_price for row in rows]
@@ -306,11 +306,11 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     plt.style.use("seaborn-v0_8-whitegrid")
     fig, ax = plt.subplots(figsize=(12, 6.75), dpi=160)
 
-    for date in dates:
+    for index, date in enumerate(dates):
         if date.weekday() >= 5 or date in holidays:
             ax.axvspan(
-                dt.datetime.combine(date, dt.time.min),
-                dt.datetime.combine(date + dt.timedelta(days=1), dt.time.min),
+                index - 0.5,
+                index + 0.5,
                 color="#d1d5db",
                 alpha=0.55,
                 linewidth=0,
@@ -318,7 +318,7 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
             )
 
     ax.plot(
-        dates,
+        x_values,
         nymex,
         color="#1f6f8b",
         linewidth=2.4,
@@ -327,7 +327,7 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
         label="GM_NYMEX_new Price (front strip)",
     )
     ax.plot(
-        dates,
+        x_values,
         katy,
         color="#c75000",
         linewidth=2.4,
@@ -336,7 +336,7 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
         label="GM_RegionalPrice RegionalPrice_Katy",
     )
     ax.plot(
-        dates,
+        x_values,
         hsc,
         color="#5b5f97",
         linewidth=2.3,
@@ -345,8 +345,9 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     )
 
     if lds and lds.nymex_price is not None:
+        lds_index = dates.index(lds.price_date)
         ax.scatter(
-            [lds.price_date],
+            [lds_index],
             [lds.nymex_price],
             s=150,
             facecolor="#ffd166",
@@ -357,7 +358,7 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
         )
         ax.annotate(
             f"LDS {lds.price_date:%b %d}\n{lds.nymex_price:.3f}",
-            xy=(lds.price_date, lds.nymex_price),
+            xy=(lds_index, lds.nymex_price),
             xytext=(10, 18),
             textcoords="offset points",
             fontsize=9.2,
@@ -390,9 +391,12 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     ax.set_xlabel("Price date")
     ax.legend(loc="upper left", frameon=True)
 
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-    ax.set_xlim(dates[0] - dt.timedelta(days=0.6), dates[-1] + dt.timedelta(days=0.6))
+    tick_positions = list(range(0, len(dates), 2))
+    if (len(dates) - 1) not in tick_positions:
+        tick_positions.append(len(dates) - 1)
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([dates[index].strftime("%b %d") for index in tick_positions])
+    ax.set_xlim(-0.6, len(dates) - 0.4)
 
     all_values = clean_values(nymex + katy + hsc)
     if all_values:
