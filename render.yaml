@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: lai-gas-chart-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GOOGLE_SHEET_ID
+        value: 1g-yuKuUhSd3nU7eDiLWFgxOcbuFkBWmWH0wZvGg6B9I
+      - key: GOOGLE_SHEET_GID
+        value: "0"
