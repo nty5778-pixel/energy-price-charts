@@ -9,12 +9,9 @@ import urllib.request
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
+from PIL import Image, ImageDraw, ImageFont
 
 
 APP_TITLE = "LAI Gas Chart API"
@@ -273,12 +270,62 @@ def fmt(value: float | None) -> str:
     return "-" if value is None else f"{value:.3f}"
 
 
+def load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def draw_text(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: str,
+    anchor: str | None = None,
+) -> None:
+    draw.text(xy, text, font=font, fill=fill, anchor=anchor)
+
+
+def draw_dashed_line(
+    draw: ImageDraw.ImageDraw,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    fill: str,
+    width: int,
+    dash: int = 14,
+    gap: int = 10,
+) -> None:
+    x1, y1 = start
+    x2, y2 = end
+    length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+    if length == 0:
+        return
+    dx = (x2 - x1) / length
+    dy = (y2 - y1) / length
+    distance = 0.0
+    while distance < length:
+        segment_end = min(distance + dash, length)
+        sx = x1 + dx * distance
+        sy = y1 + dy * distance
+        ex = x1 + dx * segment_end
+        ey = y1 + dy * segment_end
+        draw.line((sx, sy, ex, ey), fill=fill, width=width)
+        distance += dash + gap
+
+
 def render_chart(rows: list[GasRow], month: str) -> bytes:
     if not rows:
         raise HTTPException(status_code=404, detail=f"No rows found for {month}.")
 
     dates = [row.price_date for row in rows]
-    x_values = list(range(len(rows)))
     nymex = [row.nymex_price for row in rows]
     katy = [row.katy_price for row in rows]
     hsc = [row.hsc_monthly_price for row in rows]
@@ -303,115 +350,149 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     if latest_katy:
         latest_parts.append(f"Katy through {latest_katy[0].price_date:%b %d}")
 
-    fig, ax = plt.subplots(figsize=(12, 6.75), dpi=160)
-    fig.subplots_adjust(left=0.08, right=0.98, top=0.86, bottom=0.16)
-    ax.set_facecolor("#ffffff")
-    fig.patch.set_facecolor("#ffffff")
+    width, height = 1920, 1080
+    margin_left, margin_right = 120, 50
+    margin_top, margin_bottom = 150, 125
+    plot_left = margin_left
+    plot_right = width - margin_right
+    plot_top = margin_top
+    plot_bottom = height - margin_bottom
+    plot_width = plot_right - plot_left
+    plot_height = plot_bottom - plot_top
 
+    image = Image.new("RGB", (width, height), "#ffffff")
+    draw = ImageDraw.Draw(image)
+
+    font_title = load_font(42, bold=True)
+    font_body = load_font(24)
+    font_small = load_font(20)
+    font_axis = load_font(22)
+    font_legend = load_font(24)
+    font_label_bold = load_font(22, bold=True)
+
+    all_values = clean_values(nymex + katy + hsc)
+    if not all_values:
+        value_min, value_max = 0.0, 1.0
+    else:
+        value_min = min(all_values)
+        value_max = max(all_values)
+        if value_min == value_max:
+            value_min -= 0.5
+            value_max += 0.5
+        padding = max((value_max - value_min) * 0.2, 0.1)
+        value_min -= padding
+        value_max += padding
+
+    def x_for(index: int) -> float:
+        if len(dates) <= 1:
+            return plot_left
+        return plot_left + index * plot_width / (len(dates) - 1)
+
+    def y_for(value: float) -> float:
+        return plot_bottom - ((value - value_min) / (value_max - value_min)) * plot_height
+
+    # Weekend and holiday shading.
     for index, date in enumerate(dates):
         if date.weekday() >= 5 or date in holidays:
-            ax.axvspan(
-                index - 0.5,
-                index + 0.5,
-                color="#d1d5db",
-                alpha=0.55,
-                linewidth=0,
-                zorder=0,
+            day_width = plot_width / max(len(dates) - 1, 1)
+            left = int(x_for(index) - day_width / 2)
+            right = int(x_for(index) + day_width / 2)
+            draw.rectangle(
+                (max(plot_left, left), plot_top, min(plot_right, right), plot_bottom),
+                fill="#e5e7eb",
             )
 
-    ax.plot(
-        x_values,
-        nymex,
-        color="#1f6f8b",
-        linewidth=2.4,
-        marker="o",
-        markersize=5.2,
-        label="GM_NYMEX_new Price (front strip)",
-    )
-    ax.plot(
-        x_values,
-        katy,
-        color="#c75000",
-        linewidth=2.4,
-        marker="o",
-        markersize=5.2,
-        label="GM_RegionalPrice RegionalPrice_Katy",
-    )
-    ax.plot(
-        x_values,
-        hsc,
-        color="#5b5f97",
-        linewidth=2.3,
-        linestyle="--",
-        label="GM_RegionalPriceMonthly RegionalPrice_HoustonShipChl",
-    )
-
-    if lds and lds.nymex_price is not None:
-        lds_index = dates.index(lds.price_date)
-        ax.scatter(
-            [lds_index],
-            [lds.nymex_price],
-            s=150,
-            facecolor="#ffd166",
-            edgecolor="#7c2d12",
-            linewidth=1.8,
-            zorder=5,
-            label="NYMEX LDS (last business day D-2)",
-        )
-        ax.annotate(
-            f"LDS {lds.price_date:%b %d}\n{lds.nymex_price:.3f}",
-            xy=(lds_index + 0.35, lds.nymex_price),
-            fontsize=9.2,
-            fontweight="bold",
-            color="#7c2d12",
-            ha="left",
-            va="bottom",
-        )
-
-    ax.set_title(
-        f"LAI Database Gas Price Trend - {month_label}",
-        fontsize=17,
-        fontweight="bold",
-        pad=18,
-    )
-    ax.text(
-        0,
-        1.015,
-        f"NYMEX front strip: {strip_label}. {'; '.join(latest_parts)}. Blank dates indicate no value returned from DB.",
-        transform=ax.transAxes,
-        fontsize=9.5,
-        color="#4b5563",
-    )
-    ax.set_ylabel("Price")
-    ax.set_xlabel("Price date")
-    ax.legend(loc="upper left", frameon=True)
+    # Grid and frame.
+    for step in range(6):
+        y = plot_bottom - step * plot_height / 5
+        value = value_min + step * (value_max - value_min) / 5
+        draw.line((plot_left, y, plot_right, y), fill="#d7dde5", width=1)
+        draw_text(draw, (plot_left - 18, int(y)), f"{value:.2f}", font_axis, "#1f2937", anchor="rm")
 
     tick_positions = list(range(0, len(dates), 2))
     if (len(dates) - 1) not in tick_positions:
         tick_positions.append(len(dates) - 1)
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(
-        [dates[index].strftime("%b %d") for index in tick_positions],
-        rotation=35,
-        ha="right",
-    )
-    ax.set_xlim(-0.6, len(dates) - 0.4)
+    for index in tick_positions:
+        x = x_for(index)
+        draw.line((x, plot_top, x, plot_bottom), fill="#e1e7ef", width=1)
+        draw_text(
+            draw,
+            (int(x), plot_bottom + 28),
+            dates[index].strftime("%b %d"),
+            font_axis,
+            "#1f2937",
+            anchor="mm",
+        )
 
-    all_values = clean_values(nymex + katy + hsc)
-    if all_values:
-        value_min = min(all_values)
-        value_max = max(all_values)
-        padding = max((value_max - value_min) * 0.2, 0.1)
-        ax.set_ylim(value_min - padding, value_max + padding)
+    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill="#c7ccd4", width=2)
+    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill="#c7ccd4", width=2)
 
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
+    def draw_series(values: list[float | None], color: str, dashed: bool = False, markers: bool = True) -> None:
+        prev: tuple[float, float] | None = None
+        for index, value in enumerate(values):
+            if value is None:
+                prev = None
+                continue
+            point = (x_for(index), y_for(value))
+            if prev is not None:
+                if dashed:
+                    draw_dashed_line(draw, prev, point, color, 5)
+                else:
+                    draw.line((*prev, *point), fill=color, width=6)
+            if markers:
+                x, y = point
+                draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color, outline=color)
+            prev = point
 
-    ax.grid(True, which="major", axis="both", color="#d7dde5", linewidth=0.8)
+    draw_series(nymex, "#1f6f8b")
+    draw_series(katy, "#c75000")
+    draw_series(hsc, "#5b5f97", dashed=True, markers=False)
+
+    if lds and lds.nymex_price is not None:
+        lds_index = dates.index(lds.price_date)
+        x = x_for(lds_index)
+        y = y_for(lds.nymex_price)
+        draw.ellipse((x - 14, y - 14, x + 14, y + 14), fill="#ffd166", outline="#7c2d12", width=5)
+        draw_text(
+            draw,
+            (int(min(x + 18, plot_right - 130)), int(max(y - 46, plot_top + 8))),
+            f"LDS {lds.price_date:%b %d}\n{lds.nymex_price:.3f}",
+            font_label_bold,
+            "#7c2d12",
+        )
+
+    # Titles and labels.
+    draw_text(draw, (width // 2, 42), f"LAI Database Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
+    subtitle = f"NYMEX front strip: {strip_label}. {'; '.join(latest_parts)}. Blank dates indicate no value returned from DB."
+    draw_text(draw, (plot_left, 96), subtitle, font_body, "#4b5563")
+    draw_text(draw, (plot_left - 72, (plot_top + plot_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
+    draw_text(draw, ((plot_left + plot_right) // 2, height - 30), "Price date", font_body, "#24272d", anchor="mm")
+
+    # Legend.
+    legend_x, legend_y = plot_left + 12, plot_top + 18
+    legend_items = [
+        ("#1f6f8b", "GM_NYMEX_new Price (front strip)", False),
+        ("#c75000", "GM_RegionalPrice RegionalPrice_Katy", False),
+        ("#5b5f97", "GM_RegionalPriceMonthly RegionalPrice_HoustonShipChl", True),
+    ]
+    if lds and lds.nymex_price is not None:
+        legend_items.append(("#ffd166", "NYMEX LDS (last business day D-2)", False))
+    box_w, box_h = 610, 38 + len(legend_items) * 36
+    draw.rounded_rectangle((legend_x, legend_y, legend_x + box_w, legend_y + box_h), radius=8, fill="#ffffff", outline="#d4d0c8", width=2)
+    y_cursor = legend_y + 24
+    for color, label, dashed in legend_items:
+        if label.startswith("NYMEX LDS"):
+            draw.ellipse((legend_x + 20, y_cursor - 10, legend_x + 40, y_cursor + 10), fill=color, outline="#7c2d12", width=3)
+        elif dashed:
+            draw_dashed_line(draw, (legend_x + 18, y_cursor), (legend_x + 54, y_cursor), color, 5)
+        else:
+            draw.line((legend_x + 18, y_cursor, legend_x + 54, y_cursor), fill=color, width=6)
+            draw.ellipse((legend_x + 32, y_cursor - 6, legend_x + 44, y_cursor + 6), fill=color)
+        draw_text(draw, (legend_x + 72, y_cursor - 13), label, font_legend, "#24272d")
+        y_cursor += 36
 
     output = io.BytesIO()
-    fig.savefig(output, format="png")
-    plt.close(fig)
+    image.save(output, format="PNG")
     return output.getvalue()
 
 
