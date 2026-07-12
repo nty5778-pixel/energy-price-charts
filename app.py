@@ -65,7 +65,7 @@ def fetch_sheet_rows() -> list[GasRow]:
     reader = csv.DictReader(io.StringIO(raw))
     rows: list[GasRow] = []
     for source in reader:
-        price_date = parse_date(source.get("PriceDate"))
+        price_date = parse_date(pick(source, "PriceDate", "Price Date", "Date", "date"))
         if price_date is None:
             continue
 
@@ -91,6 +91,34 @@ def fetch_sheet_rows() -> list[GasRow]:
         )
 
     return sorted(rows, key=lambda row: row.price_date)
+
+
+def fetch_sheet_preview() -> dict[str, object]:
+    request = urllib.request.Request(
+        sheet_csv_url(),
+        headers={"User-Agent": "LAI-Gas-Chart-API/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8-sig")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not read Google Sheet CSV. Check sharing/publish access. {exc}",
+        ) from exc
+
+    reader = csv.DictReader(io.StringIO(raw))
+    sample_rows = []
+    for index, row in enumerate(reader):
+        if index >= 5:
+            break
+        sample_rows.append(row)
+
+    return {
+        "csv_url": sheet_csv_url(),
+        "headers": reader.fieldnames or [],
+        "sample_rows": sample_rows,
+    }
 
 
 def pick(row: dict[str, str], *names: str) -> str:
@@ -394,6 +422,11 @@ def root() -> dict[str, str]:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/debug-sheet")
+def debug_sheet() -> JSONResponse:
+    return JSONResponse(fetch_sheet_preview())
 
 
 @app.get("/chart-info")
