@@ -451,12 +451,50 @@ def chart_info(month: str | None = Query(default="current")) -> JSONResponse:
     )
 
 
+@app.get("/chart-check")
+def chart_check(month: str | None = Query(default="current")) -> JSONResponse:
+    rows = fetch_sheet_rows()
+    selected_month = choose_month(rows, month)
+    month_rows = calendar_rows(rows, selected_month)
+    nymex_count = sum(1 for row in month_rows if row.nymex_price is not None)
+    katy_count = sum(1 for row in month_rows if row.katy_price is not None)
+    hsc_count = sum(1 for row in month_rows if row.hsc_monthly_price is not None)
+    try:
+        render_chart(month_rows, selected_month)
+        render_status = "ok"
+        render_error = None
+    except Exception as exc:
+        render_status = "error"
+        render_error = f"{type(exc).__name__}: {exc}"
+
+    return JSONResponse(
+        {
+            "month": selected_month,
+            "sheet_row_count": len(rows),
+            "calendar_row_count": len(month_rows),
+            "nymex_count": nymex_count,
+            "katy_count": katy_count,
+            "hsc_count": hsc_count,
+            "render_status": render_status,
+            "render_error": render_error,
+        }
+    )
+
+
 @app.get("/chart.png")
 def chart_png(month: str | None = Query(default="current")) -> Response:
     rows = fetch_sheet_rows()
     selected_month = choose_month(rows, month)
     month_rows = calendar_rows(rows, selected_month)
-    png = render_chart(month_rows, selected_month)
+    try:
+        png = render_chart(month_rows, selected_month)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Chart rendering failed: {type(exc).__name__}: {exc}",
+        ) from exc
     filename = f"lai-gas-price-trend-{selected_month}.png"
     return Response(
         content=png,
