@@ -303,8 +303,10 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     if latest_katy:
         latest_parts.append(f"Katy through {latest_katy[0].price_date:%b %d}")
 
-    plt.style.use("seaborn-v0_8-whitegrid")
     fig, ax = plt.subplots(figsize=(12, 6.75), dpi=160)
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.86, bottom=0.16)
+    ax.set_facecolor("#ffffff")
+    fig.patch.set_facecolor("#ffffff")
 
     for index, date in enumerate(dates):
         if date.weekday() >= 5 or date in holidays:
@@ -358,19 +360,12 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
         )
         ax.annotate(
             f"LDS {lds.price_date:%b %d}\n{lds.nymex_price:.3f}",
-            xy=(lds_index, lds.nymex_price),
-            xytext=(10, 18),
-            textcoords="offset points",
+            xy=(lds_index + 0.35, lds.nymex_price),
             fontsize=9.2,
             fontweight="bold",
             color="#7c2d12",
-            arrowprops={"arrowstyle": "->", "color": "#7c2d12", "linewidth": 1.2},
-            bbox={
-                "boxstyle": "round,pad=0.25",
-                "facecolor": "#fff7ed",
-                "edgecolor": "#fed7aa",
-                "alpha": 0.95,
-            },
+            ha="left",
+            va="bottom",
         )
 
     ax.set_title(
@@ -395,7 +390,11 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     if (len(dates) - 1) not in tick_positions:
         tick_positions.append(len(dates) - 1)
     ax.set_xticks(tick_positions)
-    ax.set_xticklabels([dates[index].strftime("%b %d") for index in tick_positions])
+    ax.set_xticklabels(
+        [dates[index].strftime("%b %d") for index in tick_positions],
+        rotation=35,
+        ha="right",
+    )
     ax.set_xlim(-0.6, len(dates) - 0.4)
 
     all_values = clean_values(nymex + katy + hsc)
@@ -409,11 +408,9 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
         ax.spines[spine].set_visible(False)
 
     ax.grid(True, which="major", axis="both", color="#d7dde5", linewidth=0.8)
-    fig.autofmt_xdate(rotation=35, ha="right")
-    fig.tight_layout()
 
     output = io.BytesIO()
-    fig.savefig(output, format="png", bbox_inches="tight")
+    fig.savefig(output, format="png")
     plt.close(fig)
     return output.getvalue()
 
