@@ -16,7 +16,16 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "LAI Gas Chart API"
 APP_VERSION = "2026-07-12-split-panels-v4"
-CENTRAL_TZ = ZoneInfo("America/Chicago")
+
+
+def load_central_timezone() -> dt.tzinfo:
+    try:
+        return ZoneInfo("America/Chicago")
+    except Exception:
+        return dt.timezone(dt.timedelta(hours=-6), name="America/Chicago")
+
+
+CENTRAL_TZ = load_central_timezone()
 DEFAULT_SHEET_ID = "1g-yuKuUhSd3nU7eDiLWFgxOcbuFkBWmWH0wZvGg6B9I"
 DEFAULT_SHEET_GID = "0"
 DEFAULT_POWER_SHEET_GID = "2119869267"
