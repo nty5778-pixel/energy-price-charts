@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 APP_TITLE = "LAI Gas Chart API"
-APP_VERSION = "2026-07-12-split-panels-v4"
+APP_VERSION = "2026-07-12-split-panels-v5"
 
 
 def load_central_timezone() -> dt.tzinfo:
@@ -510,11 +510,11 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
     strip_label = ", ".join(strip_dates) or "N/A"
     latest_parts = []
     if latest_nymex:
-        latest_parts.append(f"NYMEX through {latest_nymex[0].price_date:%b %d}")
+        latest_parts.append(f"NYMEX {latest_nymex[0].price_date:%b %d}")
     if latest_katy:
-        latest_parts.append(f"Katy through {latest_katy[0].price_date:%b %d}")
+        latest_parts.append(f"Katy {latest_katy[0].price_date:%b %d}")
     if previous_lds and previous_lds.nymex_price is not None:
-        latest_parts.append(f"NYMEX LDS {previous_lds.price_date:%b %d}: {previous_lds.nymex_price:.3f}")
+        latest_parts.append(f"LDS {previous_lds.price_date:%b %d} {previous_lds.nymex_price:.3f}")
 
     width, height = 1920, 1380
     plot_left, plot_right = 120, width - 50
@@ -526,6 +526,7 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
 
     font_title = load_font(42, bold=True)
     font_body = load_font(24)
+    font_subtitle = load_font(19)
     font_small = load_font(20)
     font_axis = load_font(22)
     font_legend = load_font(24)
@@ -542,8 +543,8 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
 
     # Titles and labels.
     draw_text(draw, (width // 2, 42), f"LAI Database Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
-    subtitle = f"NYMEX front strip: {strip_label}. {'; '.join(latest_parts)}. Blank dates indicate no value returned from DB."
-    draw_text(draw, (plot_left, 96), subtitle, font_body, "#4b5563")
+    subtitle = " | ".join(latest_parts) or f"{month_label} price trend"
+    draw_text(draw, (plot_left, 96), subtitle, font_subtitle, "#4b5563")
     draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
 
     def draw_panel(
@@ -786,6 +787,7 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
 
     font_title = load_font(42, bold=True)
     font_body = load_font(24)
+    font_subtitle = load_font(19)
     font_small = load_font(20)
     font_axis = load_font(22)
     font_legend = load_font(24)
@@ -814,11 +816,11 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
     draw_text(draw, (width // 2, 42), f"ERCOT Power Daily Average - {month_label}", font_title, "#24272d", anchor="ma")
     subtitle_parts = []
     if latest_da:
-        subtitle_parts.append(f"DA through {latest_da.date:%b %d}")
+        subtitle_parts.append(f"DA {latest_da.date:%b %d}")
     if latest_rt:
-        subtitle_parts.append(f"RT through {latest_rt.date:%b %d}")
-    subtitle = "; ".join(subtitle_parts) or "No DA/RT values returned from sheet"
-    draw_text(draw, (plot_left, 98), f"DAM and RTM daily averages from Google Sheet power tab. {subtitle}.", font_body, "#4b5563")
+        subtitle_parts.append(f"RT {latest_rt.date:%b %d}")
+    subtitle = " | ".join(subtitle_parts) or "No DA/RT values"
+    draw_text(draw, (plot_left, 98), f"DA/RT daily avg | {subtitle}", font_subtitle, "#4b5563")
     draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
 
     legend_items = [("DA Daily Avg", "#1e3a5f"), ("RT Daily Avg", "#c75000")]
