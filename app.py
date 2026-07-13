@@ -19,6 +19,7 @@ APP_VERSION = "2026-07-12-split-panels-v2"
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 DEFAULT_SHEET_ID = "1g-yuKuUhSd3nU7eDiLWFgxOcbuFkBWmWH0wZvGg6B9I"
 DEFAULT_SHEET_GID = "0"
+DEFAULT_POWER_SHEET_GID = "2119869267"
 DEFAULT_POWER_SHEET_NAME = "Power"
 
 
@@ -74,7 +75,7 @@ def power_sheet_csv_url() -> str:
         return explicit_url
 
     sheet_id = os.getenv("GOOGLE_SHEET_ID", DEFAULT_SHEET_ID).strip()
-    sheet_gid = os.getenv("GOOGLE_POWER_SHEET_GID", "").strip()
+    sheet_gid = os.getenv("GOOGLE_POWER_SHEET_GID", DEFAULT_POWER_SHEET_GID).strip()
     if sheet_gid:
         query = urllib.parse.urlencode({"format": "csv", "gid": sheet_gid})
         return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?{query}"

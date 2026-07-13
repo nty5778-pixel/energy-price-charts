@@ -10,3 +10,7 @@ services:
         value: 1g-yuKuUhSd3nU7eDiLWFgxOcbuFkBWmWH0wZvGg6B9I
       - key: GOOGLE_SHEET_GID
         value: "0"
+      - key: GOOGLE_POWER_SHEET_GID
+        value: "2119869267"
+      - key: GOOGLE_POWER_SHEET_NAME
+        value: Power
