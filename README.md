@@ -6,6 +6,7 @@ This small FastAPI app reads the Google Sheet CSV and returns the LAI gas price 
 
 - `app.py` - FastAPI app and chart rendering logic
 - `requirements.txt` - Python dependencies
+- `runtime.txt` - Python runtime pin for Render
 - `render.yaml` - Render blueprint example
 
 ## Render Settings
