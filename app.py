@@ -734,14 +734,26 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
     draw_text(draw, (plot_left, 98), f"DAM and RTM daily averages from Google Sheet power tab. {subtitle}.", font_body, "#4b5563")
     draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
 
-    legend_x, legend_y = plot_right - 410, 132
-    draw.rounded_rectangle((legend_x, legend_y, legend_x + 400, legend_y + 48), radius=8, fill="#ffffff", outline="#d4d0c8", width=2)
-    draw.line((legend_x + 18, legend_y + 24, legend_x + 60, legend_y + 24), fill="#1e3a5f", width=6)
-    draw.ellipse((legend_x + 34, legend_y + 18, legend_x + 46, legend_y + 30), fill="#1e3a5f")
-    draw_text(draw, (legend_x + 74, legend_y + 10), "DA Daily Avg", font_legend, "#24272d")
-    draw.line((legend_x + 225, legend_y + 24, legend_x + 267, legend_y + 24), fill="#c75000", width=6)
-    draw.ellipse((legend_x + 241, legend_y + 18, legend_x + 253, legend_y + 30), fill="#c75000")
-    draw_text(draw, (legend_x + 281, legend_y + 10), "RT Daily Avg", font_legend, "#24272d")
+    legend_items = [("DA Daily Avg", "#1e3a5f"), ("RT Daily Avg", "#c75000")]
+    legend_item_widths = [
+        72 + int(draw.textlength(label, font=font_legend)) for label, _ in legend_items
+    ]
+    legend_width = sum(legend_item_widths) + 56 + 34 * (len(legend_items) - 1)
+    legend_height = 52
+    legend_x, legend_y = plot_right - legend_width, 138
+    draw.rounded_rectangle(
+        (legend_x, legend_y, legend_x + legend_width, legend_y + legend_height),
+        radius=8,
+        fill="#ffffff",
+        outline="#d4d0c8",
+        width=2,
+    )
+    x_cursor = legend_x + 18
+    for (label, color), item_width in zip(legend_items, legend_item_widths):
+        draw.line((x_cursor, legend_y + 26, x_cursor + 42, legend_y + 26), fill=color, width=6)
+        draw.ellipse((x_cursor + 16, legend_y + 20, x_cursor + 28, legend_y + 32), fill=color)
+        draw_text(draw, (x_cursor + 54, legend_y + 11), label, font_legend, "#24272d")
+        x_cursor += item_width + 34
 
     for index, date in enumerate(dates):
         if date.weekday() >= 5 or date in holidays:
