@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 APP_TITLE = "LAI Gas Chart API"
-APP_VERSION = "2026-07-12-split-panels-v6"
+APP_VERSION = "2026-07-12-split-panels-v7"
 
 
 def load_central_timezone() -> dt.tzinfo:
@@ -64,6 +64,7 @@ class PowerDailyRow:
     date: dt.date
     dam_avg: float | None
     rtm_avg: float | None
+    peak_load: float | None
     sample_count: int
 
 
@@ -328,11 +329,13 @@ def power_daily_rows(rows: list[PowerHourlyRow], month: str) -> list[PowerDailyR
         day_rows = grouped.get(cursor, [])
         dam_values = [row.dam for row in day_rows if row.dam is not None]
         rtm_values = [row.rtm for row in day_rows if row.rtm is not None]
+        demand_values = [row.demand for row in day_rows if row.demand is not None]
         result.append(
             PowerDailyRow(
                 date=cursor,
                 dam_avg=average(dam_values),
                 rtm_avg=average(rtm_values),
+                peak_load=max(demand_values) if demand_values else None,
                 sample_count=len(day_rows),
             )
         )
@@ -537,9 +540,7 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
             return float(plot_left)
         return plot_left + index * plot_width / (len(dates) - 1)
 
-    tick_positions = list(range(0, len(dates), 2))
-    if (len(dates) - 1) not in tick_positions:
-        tick_positions.append(len(dates) - 1)
+    tick_positions = list(range(len(dates)))
 
     # Titles and labels.
     draw_text(draw, (width // 2, 42), f"Natural Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
@@ -623,7 +624,7 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
             x = x_for(index)
             draw.line((x, top, x, bottom), fill="#e1e7ef", width=1)
             if show_x_labels:
-                draw_text(draw, (int(x), bottom + 28), dates[index].strftime("%b %d"), font_axis, "#1f2937", anchor="mm")
+                draw_text(draw, (int(x), bottom + 28), str(dates[index].day), font_axis, "#1f2937", anchor="mm")
 
         draw.line((plot_left, bottom, plot_right, bottom), fill="#c7ccd4", width=2)
         draw.line((plot_left, top, plot_left, bottom), fill="#c7ccd4", width=2)
@@ -754,9 +755,9 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
         show_x_labels=True,
     )
 
-    draw_text(draw, (plot_left - 72, (panel1_top + panel1_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
-    draw_text(draw, (plot_left - 72, (panel2_top + panel2_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
-    draw_text(draw, ((plot_left + plot_right) // 2, height - 32), "Price date", font_body, "#24272d", anchor="mm")
+    draw_text(draw, (plot_left - 104, (panel1_top + panel1_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
+    draw_text(draw, (plot_left - 104, (panel2_top + panel2_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
+    draw_text(draw, ((plot_left + plot_right) // 2, height - 32), "Date", font_body, "#24272d", anchor="mm")
 
     output = io.BytesIO()
     image.save(output, format="PNG")
@@ -770,17 +771,18 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
     dates = [row.date for row in rows]
     dam = [row.dam_avg for row in rows]
     rtm = [row.rtm_avg for row in rows]
-    valid_values = clean_values(dam + rtm)
+    peak_load = [row.peak_load for row in rows]
     month_label = dates[0].strftime("%B %Y")
     latest_da = next((row for row in reversed(rows) if row.dam_avg is not None), None)
     latest_rt = next((row for row in reversed(rows) if row.rtm_avg is not None), None)
+    latest_peak = next((row for row in reversed(rows) if row.peak_load is not None), None)
     holidays = us_market_holidays(dates[0].year)
 
-    width, height = 1920, 980
-    plot_left, plot_right = 120, width - 50
-    plot_top, plot_bottom = 210, 850
+    width, height = 1920, 1340
+    plot_left, plot_right = 135, width - 50
+    price_top, price_bottom = 230, 700
+    load_top, load_bottom = 875, 1210
     plot_width = plot_right - plot_left
-    plot_height = plot_bottom - plot_top
 
     image = Image.new("RGB", (width, height), "#ffffff")
     draw = ImageDraw.Draw(image)
@@ -793,25 +795,10 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
     font_legend = load_font(24)
     font_label_bold = load_font(22, bold=True)
 
-    if not valid_values:
-        value_min, value_max = 0.0, 1.0
-    else:
-        value_min = min(valid_values)
-        value_max = max(valid_values)
-        if value_min == value_max:
-            value_min -= 5.0
-            value_max += 5.0
-        padding = max((value_max - value_min) * 0.18, 5.0)
-        value_min -= padding
-        value_max += padding
-
     def x_for(index: int) -> float:
         if len(dates) <= 1:
             return float(plot_left)
         return plot_left + index * plot_width / (len(dates) - 1)
-
-    def y_for(value: float) -> float:
-        return plot_bottom - ((value - value_min) / (value_max - value_min)) * plot_height
 
     draw_text(draw, (width // 2, 42), f"ERCOT Power Daily Average - {month_label}", font_title, "#24272d", anchor="ma")
     subtitle_parts = []
@@ -819,82 +806,167 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
         subtitle_parts.append(f"DA {latest_da.date:%b %d}")
     if latest_rt:
         subtitle_parts.append(f"RT {latest_rt.date:%b %d}")
+    if latest_peak:
+        subtitle_parts.append(f"Peak {latest_peak.date:%b %d}")
     subtitle = " | ".join(subtitle_parts) or "No DA/RT values"
-    draw_text(draw, (plot_left, 98), f"DA/RT daily avg | {subtitle}", font_subtitle, "#4b5563")
+    draw_text(draw, (plot_left, 98), f"DA/RT avg + Peak Load | {subtitle}", font_subtitle, "#4b5563")
     draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
 
-    legend_items = [("DA Daily Avg", "#1e3a5f"), ("RT Daily Avg", "#c75000")]
-    legend_item_widths = [
-        72 + int(draw.textlength(label, font=font_legend)) for label, _ in legend_items
-    ]
-    legend_width = sum(legend_item_widths) + 56 + 34 * (len(legend_items) - 1)
-    legend_height = 52
-    legend_x, legend_y = plot_right - legend_width, 138
-    draw.rounded_rectangle(
-        (legend_x, legend_y, legend_x + legend_width, legend_y + legend_height),
-        radius=8,
-        fill="#ffffff",
-        outline="#d4d0c8",
-        width=2,
+    tick_positions = list(range(len(dates)))
+
+    def draw_value_box(x: float, y: float, label: str, color: str, top: int, bottom: int, offset_y: int = -34) -> None:
+        text_box = draw.textbbox((0, 0), label, font=font_label_bold)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+        box_width = text_width + 18
+        box_height = text_height + 12
+        if x > plot_right - 190:
+            box_left = max(plot_left + 8, int(x) - box_width - 18)
+        else:
+            box_left = min(plot_right - box_width - 8, int(x) + 18)
+        box_top = max(top + 8, min(bottom - box_height - 8, int(y) + offset_y))
+        draw.rounded_rectangle(
+            (box_left, box_top, box_left + box_width, box_top + box_height),
+            radius=8,
+            fill="#ffffff",
+            outline=color,
+            width=2,
+        )
+        draw_text(draw, (box_left + 9, box_top + 5), label, font_label_bold, color)
+
+    def draw_panel(
+        title: str,
+        top: int,
+        bottom: int,
+        series: list[dict[str, object]],
+        y_label: str,
+        y_format: str,
+        min_padding: float,
+        show_x_labels: bool,
+    ) -> None:
+        header_y = top - 70
+        draw_text(draw, (plot_left, header_y), title, font_label_bold, "#24272d")
+
+        legend_items = [(str(item["label"]), str(item["color"])) for item in series]
+        legend_item_widths = [72 + int(draw.textlength(label, font=font_small)) for label, _ in legend_items]
+        legend_width = sum(legend_item_widths) + 44 + 30 * (len(legend_items) - 1)
+        legend_height = 44
+        legend_x, legend_y = plot_right - legend_width, header_y - 8
+        draw.rounded_rectangle(
+            (legend_x, legend_y, legend_x + legend_width, legend_y + legend_height),
+            radius=8,
+            fill="#ffffff",
+            outline="#d4d0c8",
+            width=2,
+        )
+        x_cursor = legend_x + 16
+        for (label, color), item_width in zip(legend_items, legend_item_widths):
+            draw.line((x_cursor, legend_y + 22, x_cursor + 42, legend_y + 22), fill=color, width=6)
+            draw.ellipse((x_cursor + 16, legend_y + 16, x_cursor + 28, legend_y + 28), fill=color)
+            draw_text(draw, (x_cursor + 54, legend_y + 8), label, font_small, "#24272d")
+            x_cursor += item_width + 30
+
+        panel_values: list[float] = []
+        for item in series:
+            panel_values.extend(clean_values(item["values"]))  # type: ignore[arg-type]
+        if not panel_values:
+            value_min, value_max = 0.0, 1.0
+        else:
+            value_min = min(panel_values)
+            value_max = max(panel_values)
+            if value_min == value_max:
+                value_min -= min_padding
+                value_max += min_padding
+            padding = max((value_max - value_min) * 0.18, min_padding)
+            value_min -= padding
+            value_max += padding
+
+        panel_height = bottom - top
+
+        def y_for(value: float) -> float:
+            return bottom - ((value - value_min) / (value_max - value_min)) * panel_height
+
+        for index, date in enumerate(dates):
+            if date.weekday() >= 5 or date in holidays:
+                day_width = plot_width / max(len(dates) - 1, 1)
+                left = int(x_for(index) - day_width / 2)
+                right = int(x_for(index) + day_width / 2)
+                draw.rectangle((max(plot_left, left), top, min(plot_right, right), bottom), fill="#e5e7eb")
+
+        for step in range(6):
+            y = bottom - step * panel_height / 5
+            value = value_min + step * (value_max - value_min) / 5
+            draw.line((plot_left, y, plot_right, y), fill="#d7dde5", width=1)
+            label = f"{value:.0f}" if y_format == "integer" else f"{value:,.0f}"
+            draw_text(draw, (plot_left - 18, int(y)), label, font_axis, "#1f2937", anchor="rm")
+
+        for index in tick_positions:
+            x = x_for(index)
+            draw.line((x, top, x, bottom), fill="#e1e7ef", width=1)
+            if show_x_labels:
+                draw_text(draw, (int(x), bottom + 30), str(dates[index].day), font_axis, "#1f2937", anchor="mm")
+
+        draw.line((plot_left, bottom, plot_right, bottom), fill="#c7ccd4", width=2)
+        draw.line((plot_left, top, plot_left, bottom), fill="#c7ccd4", width=2)
+
+        for item in series:
+            values = item["values"]  # type: ignore[assignment]
+            color = str(item["color"])
+            prev: tuple[float, float] | None = None
+            for index, value in enumerate(values):
+                if value is None:
+                    prev = None
+                    continue
+                point = (x_for(index), y_for(float(value)))
+                if prev is not None:
+                    draw.line((*prev, *point), fill=color, width=6)
+                x, y = point
+                draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color, outline=color)
+                prev = point
+
+        for item in series:
+            values = item["values"]  # type: ignore[assignment]
+            color = str(item["color"])
+            prefix = str(item.get("value_prefix", ""))
+            decimals = int(item.get("decimals", 0))
+            for index in range(len(values) - 1, -1, -1):
+                value = values[index]
+                if value is None:
+                    continue
+                formatted = f"{float(value):,.0f}" if decimals == 0 else f"{float(value):,.{decimals}f}"
+                draw_value_box(x_for(index), y_for(float(value)), f"{prefix}{formatted}", color, top, bottom)
+                break
+
+        draw_text(draw, (plot_left - 106, (top + bottom) // 2), y_label, font_body, "#24272d", anchor="mm")
+
+    draw_panel(
+        "DA / RT Daily Average",
+        price_top,
+        price_bottom,
+        [
+            {"values": dam, "color": "#1e3a5f", "label": "DA Daily Avg", "value_prefix": "DA ", "decimals": 2},
+            {"values": rtm, "color": "#c75000", "label": "RT Daily Avg", "value_prefix": "RT ", "decimals": 2},
+        ],
+        "$/MWh",
+        "integer",
+        5.0,
+        show_x_labels=False,
     )
-    x_cursor = legend_x + 18
-    for (label, color), item_width in zip(legend_items, legend_item_widths):
-        draw.line((x_cursor, legend_y + 26, x_cursor + 42, legend_y + 26), fill=color, width=6)
-        draw.ellipse((x_cursor + 16, legend_y + 20, x_cursor + 28, legend_y + 32), fill=color)
-        draw_text(draw, (x_cursor + 54, legend_y + 11), label, font_legend, "#24272d")
-        x_cursor += item_width + 34
 
-    for index, date in enumerate(dates):
-        if date.weekday() >= 5 or date in holidays:
-            day_width = plot_width / max(len(dates) - 1, 1)
-            left = int(x_for(index) - day_width / 2)
-            right = int(x_for(index) + day_width / 2)
-            draw.rectangle((max(plot_left, left), plot_top, min(plot_right, right), plot_bottom), fill="#e5e7eb")
+    draw_panel(
+        "Daily Peak Load",
+        load_top,
+        load_bottom,
+        [
+            {"values": peak_load, "color": "#2f6f4e", "label": "Peak Load", "value_prefix": "Peak ", "decimals": 0},
+        ],
+        "MW",
+        "comma",
+        500.0,
+        show_x_labels=True,
+    )
 
-    for step in range(6):
-        y = plot_bottom - step * plot_height / 5
-        value = value_min + step * (value_max - value_min) / 5
-        draw.line((plot_left, y, plot_right, y), fill="#d7dde5", width=1)
-        draw_text(draw, (plot_left - 18, int(y)), f"{value:.0f}", font_axis, "#1f2937", anchor="rm")
-
-    tick_positions = list(range(0, len(dates), 2))
-    if (len(dates) - 1) not in tick_positions:
-        tick_positions.append(len(dates) - 1)
-    for index in tick_positions:
-        x = x_for(index)
-        draw.line((x, plot_top, x, plot_bottom), fill="#e1e7ef", width=1)
-        draw_text(draw, (int(x), plot_bottom + 30), dates[index].strftime("%b %d"), font_axis, "#1f2937", anchor="mm")
-
-    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill="#c7ccd4", width=2)
-    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill="#c7ccd4", width=2)
-
-    def draw_series(values: list[float | None], color: str) -> None:
-        prev: tuple[float, float] | None = None
-        for index, value in enumerate(values):
-            if value is None:
-                prev = None
-                continue
-            point = (x_for(index), y_for(value))
-            if prev is not None:
-                draw.line((*prev, *point), fill=color, width=6)
-            x, y = point
-            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color, outline=color)
-            prev = point
-
-    draw_series(dam, "#1e3a5f")
-    draw_series(rtm, "#c75000")
-
-    if latest_da and latest_da.dam_avg is not None:
-        x = x_for(dates.index(latest_da.date))
-        y = y_for(latest_da.dam_avg)
-        draw_text(draw, (int(x + 14), int(y - 34)), f"DA {latest_da.dam_avg:.2f}", font_label_bold, "#1e3a5f")
-    if latest_rt and latest_rt.rtm_avg is not None:
-        x = x_for(dates.index(latest_rt.date))
-        y = y_for(latest_rt.rtm_avg)
-        draw_text(draw, (int(x + 14), int(y + 10)), f"RT {latest_rt.rtm_avg:.2f}", font_label_bold, "#c75000")
-
-    draw_text(draw, (plot_left - 72, (plot_top + plot_bottom) // 2), "$/MWh", font_body, "#24272d", anchor="mm")
-    draw_text(draw, ((plot_left + plot_right) // 2, height - 36), "Price date", font_body, "#24272d", anchor="mm")
+    draw_text(draw, ((plot_left + plot_right) // 2, height - 36), "Date", font_body, "#24272d", anchor="mm")
 
     output = io.BytesIO()
     image.save(output, format="PNG")
@@ -964,6 +1036,7 @@ def power_chart_info(month: str | None = Query(default="current")) -> JSONRespon
     daily_rows = power_daily_rows(rows, selected_month)
     latest_da = next((row for row in reversed(daily_rows) if row.dam_avg is not None), None)
     latest_rt = next((row for row in reversed(daily_rows) if row.rtm_avg is not None), None)
+    latest_peak = next((row for row in reversed(daily_rows) if row.peak_load is not None), None)
     return JSONResponse(
         {
             "month": selected_month,
@@ -971,10 +1044,13 @@ def power_chart_info(month: str | None = Query(default="current")) -> JSONRespon
             "calendar_row_count": len(daily_rows),
             "da_day_count": sum(1 for row in daily_rows if row.dam_avg is not None),
             "rt_day_count": sum(1 for row in daily_rows if row.rtm_avg is not None),
+            "peak_load_day_count": sum(1 for row in daily_rows if row.peak_load is not None),
             "latest_da_date": latest_da.date.isoformat() if latest_da else None,
             "latest_da_avg": latest_da.dam_avg if latest_da else None,
             "latest_rt_date": latest_rt.date.isoformat() if latest_rt else None,
             "latest_rt_avg": latest_rt.rtm_avg if latest_rt else None,
+            "latest_peak_load_date": latest_peak.date.isoformat() if latest_peak else None,
+            "latest_peak_load": latest_peak.peak_load if latest_peak else None,
         }
     )
 
@@ -1032,6 +1108,7 @@ def power_chart_check(month: str | None = Query(default="current")) -> JSONRespo
             "calendar_row_count": len(daily_rows),
             "da_day_count": sum(1 for row in daily_rows if row.dam_avg is not None),
             "rt_day_count": sum(1 for row in daily_rows if row.rtm_avg is not None),
+            "peak_load_day_count": sum(1 for row in daily_rows if row.peak_load is not None),
             "render_status": render_status,
             "render_error": render_error,
         }
