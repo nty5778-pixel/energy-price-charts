@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 APP_TITLE = "LAI Gas Chart API"
-APP_VERSION = "2026-07-12-split-panels-v7"
+APP_VERSION = "2026-07-12-split-panels-v8"
 
 
 def load_central_timezone() -> dt.tzinfo:
@@ -520,7 +520,7 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
         latest_parts.append(f"LDS {previous_lds.price_date:%b %d} {previous_lds.nymex_price:.3f}")
 
     width, height = 1920, 1380
-    plot_left, plot_right = 120, width - 50
+    plot_left, plot_right = 170, width - 50
     panel1_top, panel1_bottom = 245, 665
     panel2_top, panel2_bottom = 880, 1270
     plot_width = plot_right - plot_left
@@ -545,7 +545,7 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
     # Titles and labels.
     draw_text(draw, (width // 2, 42), f"Natural Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
     subtitle = " | ".join(latest_parts) or f"{month_label} price trend"
-    draw_text(draw, (plot_left, 96), subtitle, font_subtitle, "#4b5563")
+    draw_text(draw, (width // 2, 96), subtitle, font_subtitle, "#4b5563", anchor="ma")
     draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
 
     def draw_panel(
@@ -706,7 +706,26 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
             x = x_for(lds_index)
             y = y_for(lds_marker.nymex_price)
             draw.ellipse((x - 14, y - 14, x + 14, y + 14), fill="#ffd166", outline="#7c2d12", width=5)
-            draw_text(draw, (int(min(x + 18, plot_right - 130)), int(max(y - 42, top + 8))), f"LDS {lds_marker.price_date:%b %d}\n{lds_marker.nymex_price:.3f}", font_label_bold, "#7c2d12")
+            label_text = f"LDS {lds_marker.price_date:%b %d}\n{lds_marker.nymex_price:.3f}"
+            text_box = draw.multiline_textbbox((0, 0), label_text, font=font_label_bold, spacing=4)
+            text_width = text_box[2] - text_box[0]
+            text_height = text_box[3] - text_box[1]
+            box_width = text_width + 18
+            box_height = text_height + 14
+            box_top = max(top + 8, min(bottom - box_height - 8, int(y) - box_height - 18))
+            for prior_top, prior_bottom in label_boxes:
+                if box_top < prior_bottom + 8 and box_top + box_height > prior_top - 8:
+                    box_top = min(bottom - box_height - 8, prior_bottom + 8)
+            box_left = min(plot_right - box_width - 8, max(plot_left + 8, int(x) + 18))
+            draw.rounded_rectangle(
+                (box_left, box_top, box_left + box_width, box_top + box_height),
+                radius=8,
+                fill="#ffffff",
+                outline="#7c2d12",
+                width=2,
+            )
+            draw.multiline_text((box_left + 9, box_top + 6), label_text, font=font_label_bold, fill="#7c2d12", spacing=4)
+            label_boxes.append((box_top, box_top + box_height))
 
     draw_panel(
         "NYMEX Daily Price",
@@ -755,8 +774,8 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
         show_x_labels=True,
     )
 
-    draw_text(draw, (plot_left - 104, (panel1_top + panel1_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
-    draw_text(draw, (plot_left - 104, (panel2_top + panel2_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
+    draw_text(draw, (plot_left - 110, (panel1_top + panel1_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
+    draw_text(draw, (plot_left - 110, (panel2_top + panel2_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
     draw_text(draw, ((plot_left + plot_right) // 2, height - 32), "Date", font_body, "#24272d", anchor="mm")
 
     output = io.BytesIO()
@@ -779,7 +798,7 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
     holidays = us_market_holidays(dates[0].year)
 
     width, height = 1920, 1340
-    plot_left, plot_right = 135, width - 50
+    plot_left, plot_right = 175, width - 50
     price_top, price_bottom = 230, 700
     load_top, load_bottom = 875, 1210
     plot_width = plot_right - plot_left
@@ -809,12 +828,21 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
     if latest_peak:
         subtitle_parts.append(f"Peak {latest_peak.date:%b %d}")
     subtitle = " | ".join(subtitle_parts) or "No DA/RT values"
-    draw_text(draw, (plot_left, 98), f"DA/RT avg + Peak Load | {subtitle}", font_subtitle, "#4b5563")
+    draw_text(draw, (width // 2, 98), f"DA/RT avg + Peak Load | {subtitle}", font_subtitle, "#4b5563", anchor="ma")
     draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
 
     tick_positions = list(range(len(dates)))
 
-    def draw_value_box(x: float, y: float, label: str, color: str, top: int, bottom: int, offset_y: int = -34) -> None:
+    def draw_value_box(
+        x: float,
+        y: float,
+        label: str,
+        color: str,
+        top: int,
+        bottom: int,
+        occupied_boxes: list[tuple[int, int]],
+        offset_y: int = -34,
+    ) -> None:
         text_box = draw.textbbox((0, 0), label, font=font_label_bold)
         text_width = text_box[2] - text_box[0]
         text_height = text_box[3] - text_box[1]
@@ -825,6 +853,9 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
         else:
             box_left = min(plot_right - box_width - 8, int(x) + 18)
         box_top = max(top + 8, min(bottom - box_height - 8, int(y) + offset_y))
+        for prior_top, prior_bottom in occupied_boxes:
+            if box_top < prior_bottom + 8 and box_top + box_height > prior_top - 8:
+                box_top = min(bottom - box_height - 8, prior_bottom + 8)
         draw.rounded_rectangle(
             (box_left, box_top, box_left + box_width, box_top + box_height),
             radius=8,
@@ -833,6 +864,7 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
             width=2,
         )
         draw_text(draw, (box_left + 9, box_top + 5), label, font_label_bold, color)
+        occupied_boxes.append((box_top, box_top + box_height))
 
     def draw_panel(
         title: str,
@@ -924,6 +956,7 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
                 draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color, outline=color)
                 prev = point
 
+        latest_labels: list[dict[str, object]] = []
         for item in series:
             values = item["values"]  # type: ignore[assignment]
             color = str(item["color"])
@@ -934,10 +967,29 @@ def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
                 if value is None:
                     continue
                 formatted = f"{float(value):,.0f}" if decimals == 0 else f"{float(value):,.{decimals}f}"
-                draw_value_box(x_for(index), y_for(float(value)), f"{prefix}{formatted}", color, top, bottom)
+                latest_labels.append(
+                    {
+                        "index": index,
+                        "value": float(value),
+                        "text": f"{prefix}{formatted}",
+                        "color": color,
+                    }
+                )
                 break
 
-        draw_text(draw, (plot_left - 106, (top + bottom) // 2), y_label, font_body, "#24272d", anchor="mm")
+        occupied_boxes: list[tuple[int, int]] = []
+        for label in sorted(latest_labels, key=lambda item: y_for(float(item["value"]))):
+            draw_value_box(
+                x_for(int(label["index"])),
+                y_for(float(label["value"])),
+                str(label["text"]),
+                str(label["color"]),
+                top,
+                bottom,
+                occupied_boxes,
+            )
+
+        draw_text(draw, (plot_left - 110, (top + bottom) // 2), y_label, font_body, "#24272d", anchor="mm")
 
     draw_panel(
         "DA / RT Daily Average",
