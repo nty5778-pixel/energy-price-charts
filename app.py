@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 APP_TITLE = "LAI Gas Chart API"
-APP_VERSION = "2026-07-12-split-panels-v5"
+APP_VERSION = "2026-07-12-split-panels-v6"
 
 
 def load_central_timezone() -> dt.tzinfo:
@@ -542,7 +542,7 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
         tick_positions.append(len(dates) - 1)
 
     # Titles and labels.
-    draw_text(draw, (width // 2, 42), f"LAI Database Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
+    draw_text(draw, (width // 2, 42), f"Natural Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
     subtitle = " | ".join(latest_parts) or f"{month_label} price trend"
     draw_text(draw, (plot_left, 96), subtitle, font_subtitle, "#4b5563")
     draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
@@ -732,7 +732,7 @@ def render_chart(rows: list[GasRow], month: str, previous_lds: GasRow | None = N
     )
 
     draw_panel(
-        "IFERC Houston Ship Channel + Katy",
+        "HSC IFERC + Katy GD",
         "HSC monthly fixed line versus Katy Gas Daily",
         panel2_top,
         panel2_bottom,
