@@ -1,585 +1,446 @@
-from __future__ import annotations
+"""
+Energy Price Dashboard — Chart Image Service
+Render Web Service (Flask). n8n이 HTTP GET으로 호출하면 지표별 PNG를 반환한다.
 
-import csv
-import datetime as dt
+Endpoints:
+  GET /                      → health check
+  GET /chart/nymex          → NYMEX 일별 (당월)
+  GET /chart/hsc_katy       → IFERC HSC vs GD Katy (당월)
+  GET /chart/power_dart     → ERCOT Daily DA/RT (당월)
+  GET /chart/power_peak     → Daily Peak Load & Net Load at Peak (당월)
+  GET /chart/all            → 4장 zip (선택)
+
+Query params (공통, 선택):
+  ?month=YYYY-MM            → 대상 월 (기본: 현재 CT 기준 당월)
+
+환경변수:
+  SHEET_ID                  → Google 스프레드시트 ID
+  GOOGLE_API_KEY            → Sheets API 키 (읽기 전용, 시트 공개 필요)
+"""
+
 import io
 import os
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
+import sys
+import zipfile
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, Response
-from PIL import Image, ImageDraw, ImageFont
+import requests
+import matplotlib
+
+matplotlib.use("Agg")  # 헤드리스 렌더링
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import MaxNLocator, MultipleLocator, FixedLocator
+from flask import Flask, send_file, request, jsonify
+
+sys.setrecursionlimit(10000)
+
+app = Flask(__name__)
+
+# ── 설정 ────────────────────────────────────────────────────────
+SHEET_ID = os.environ.get("SHEET_ID", "1g-yuKuUhSd3nU7eDiLWFgxOcbuFkBWmWH0wZvGg6B9I")
+API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+CT = ZoneInfo("America/Chicago")
+
+# 대시보드와 동일한 컬러 팔레트 (글래스 테마)
+C_SKY = "#0ea5e9"      # DAM / NYMEX
+C_PURPLE = "#7c3aed"   # RTM / Net Load
+C_CYAN = "#0284c7"     # Katy
+C_NAVY = "#075985"     # HSC
+C_RED = "#e11d48"      # Peak Load
+C_TEXT = "#0c4a6e"
+C_MUTED = "#5b8bb5"
+C_GRID = "#dbeafe"
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 11,
+    "axes.edgecolor": C_GRID,
+    "axes.linewidth": 0.8,
+    "axes.grid": True,
+    "grid.color": C_GRID,
+    "grid.linewidth": 0.8,
+    "text.color": C_TEXT,
+    "axes.labelcolor": C_MUTED,
+    "xtick.color": C_MUTED,
+    "ytick.color": C_MUTED,
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "savefig.facecolor": "white",
+})
 
 
-APP_TITLE = "LAI Gas Chart API"
-CENTRAL_TZ = ZoneInfo("America/Chicago")
-DEFAULT_SHEET_ID = "1g-yuKuUhSd3nU7eDiLWFgxOcbuFkBWmWH0wZvGg6B9I"
-DEFAULT_SHEET_GID = "0"
+# ── 유틸 ────────────────────────────────────────────────────────
+def current_month():
+    now = datetime.now(CT)
+    return f"{now.year}-{now.month:02d}"
 
 
-app = FastAPI(title=APP_TITLE)
-
-
-@dataclass
-class GasRow:
-    price_date: dt.date
-    nymex_strip_date: dt.date | None
-    nymex_price: float | None
-    katy_price: float | None
-    hsc_monthly_price: float | None
-    updated_at: str
-
-
-def sheet_csv_url() -> str:
-    explicit_url = os.getenv("GOOGLE_SHEET_CSV_URL", "").strip()
-    if explicit_url:
-        return explicit_url
-
-    sheet_id = os.getenv("GOOGLE_SHEET_ID", DEFAULT_SHEET_ID).strip()
-    sheet_gid = os.getenv("GOOGLE_SHEET_GID", DEFAULT_SHEET_GID).strip()
-    query = urllib.parse.urlencode({"format": "csv", "gid": sheet_gid})
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?{query}"
-
-
-def fetch_sheet_rows() -> list[GasRow]:
-    request = urllib.request.Request(
-        sheet_csv_url(),
-        headers={"User-Agent": "LAI-Gas-Chart-API/1.0"},
+def fetch_sheet(tab):
+    """Google Sheets 탭 전체를 2D 리스트로 반환."""
+    if not API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY 환경변수가 설정되지 않았습니다.")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}"
+        f"/values/{tab}?key={API_KEY}"
     )
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    return r.json().get("values", [])
+
+
+def to_float(x):
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8-sig")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not read Google Sheet CSV. Check sharing/publish access. {exc}",
-        ) from exc
+        if x is None or x == "":
+            return None
+        return float(x)
+    except (ValueError, TypeError):
+        return None
 
-    reader = csv.DictReader(io.StringIO(raw))
-    rows: list[GasRow] = []
-    for source in reader:
-        price_date = parse_date(pick(source, "PriceDate", "Price Date", "Date", "date"))
-        if price_date is None:
-            continue
 
-        rows.append(
-            GasRow(
-                price_date=price_date,
-                nymex_strip_date=parse_date(
-                    pick(source, "NYMEX_StripDate_Final", "NYMEX_StripDate")
-                ),
-                nymex_price=parse_float(pick(source, "NYMEX_Price_Final", "NYMEX_Price")),
-                katy_price=parse_float(
-                    pick(source, "RegionalPrice_Katy_Final", "RegionalPrice_Katy")
-                ),
-                hsc_monthly_price=parse_float(
-                    pick(
-                        source,
-                        "RegionalPrice_HoustonShipChl_Monthly_Final",
-                        "RegionalPrice_HoustonShipChl_Monthly",
-                    )
-                ),
-                updated_at=source.get("UpdatedAt", "") or "",
-            )
+def month_label(ym):
+    y, m = ym.split("-")
+    return datetime(int(y), int(m), 1).strftime("%B %Y")
+
+
+def style_axes(ax, ylabel=None, legend_items=None):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(length=0)
+    if ylabel:
+        ax.set_ylabel(ylabel, fontsize=10)
+    # 상단에 데이터와 겹치지 않도록 y축 여유 확보
+    ymin, ymax = ax.get_ylim()
+    ax.set_ylim(ymin, ymax + (ymax - ymin) * 0.18)
+    # ax.legend()는 Python 3.14 + matplotlib에서 deepcopy 무한 재귀를 일으키므로
+    # 사용하지 않고, 축 상단에 색상 선 + 라벨을 직접 그려 범례를 구성한다.
+    if legend_items:
+        draw_manual_legend(ax, legend_items)
+
+
+def draw_manual_legend(ax, items):
+    """items: [(label, color, dashed(bool)), ...] 를 축 상단에 수동 범례로 그린다."""
+    x = 0.02          # axes 좌표 시작 x
+    y = 0.94          # axes 좌표 y (상단)
+    line_len = 0.035  # 선 길이 (axes 좌표)
+    gap = 0.015       # 선-텍스트 간격
+    for label, color, dashed in items:
+        ax.plot(
+            [x, x + line_len], [y, y],
+            transform=ax.transAxes, color=color, lw=2,
+            ls="--" if dashed else "-", clip_on=False, solid_capstyle="round",
         )
-
-    return sorted(rows, key=lambda row: row.price_date)
-
-
-def fetch_sheet_preview() -> dict[str, object]:
-    request = urllib.request.Request(
-        sheet_csv_url(),
-        headers={"User-Agent": "LAI-Gas-Chart-API/1.0"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8-sig")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not read Google Sheet CSV. Check sharing/publish access. {exc}",
-        ) from exc
-
-    reader = csv.DictReader(io.StringIO(raw))
-    sample_rows = []
-    for index, row in enumerate(reader):
-        if index >= 5:
-            break
-        sample_rows.append(row)
-
-    return {
-        "csv_url": sheet_csv_url(),
-        "headers": reader.fieldnames or [],
-        "sample_rows": sample_rows,
-    }
-
-
-def pick(row: dict[str, str], *names: str) -> str:
-    for name in names:
-        value = row.get(name)
-        if value not in (None, ""):
-            return value
-    return ""
-
-
-def parse_date(value: str | None) -> dt.date | None:
-    if not value:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return dt.date.fromisoformat(text[:10])
-    except ValueError:
-        return None
-
-
-def parse_float(value: str | None) -> float | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def current_month() -> str:
-    today = dt.datetime.now(CENTRAL_TZ).date()
-    return f"{today.year:04d}-{today.month:02d}"
-
-
-def choose_month(rows: list[GasRow], requested_month: str | None) -> str:
-    if requested_month and requested_month.lower() != "current":
-        return requested_month[:7]
-
-    month = current_month()
-    if any(row.price_date.strftime("%Y-%m") == month for row in rows):
-        return month
-
-    months = sorted({row.price_date.strftime("%Y-%m") for row in rows})
-    if not months:
-        raise HTTPException(status_code=404, detail="No dated rows were found in the sheet.")
-    return months[-1]
-
-
-def month_bounds(month: str) -> tuple[dt.date, dt.date]:
-    year, month_number = map(int, month.split("-"))
-    start = dt.date(year, month_number, 1)
-    if month_number == 12:
-        end = dt.date(year + 1, 1, 1)
-    else:
-        end = dt.date(year, month_number + 1, 1)
-    return start, end
-
-
-def calendar_rows(rows: list[GasRow], month: str) -> list[GasRow]:
-    start, end = month_bounds(month)
-    by_date = {row.price_date: row for row in rows if start <= row.price_date < end}
-    result: list[GasRow] = []
-    cursor = start
-    while cursor < end:
-        result.append(
-            by_date.get(
-                cursor,
-                GasRow(
-                    price_date=cursor,
-                    nymex_strip_date=None,
-                    nymex_price=None,
-                    katy_price=None,
-                    hsc_monthly_price=None,
-                    updated_at="",
-                ),
-            )
+        ax.text(
+            x + line_len + gap, y, label,
+            transform=ax.transAxes, fontsize=10, va="center", ha="left",
+            color=C_TEXT,
         )
-        cursor += dt.timedelta(days=1)
-    return result
+        # 다음 항목 x 위치 = 텍스트 길이에 비례해 이동 (대략치)
+        x += line_len + gap + 0.018 * (len(label) + 1)
 
 
-def nth_weekday(year: int, month: int, weekday: int, nth: int) -> dt.date:
-    date = dt.date(year, month, 1)
-    days = (weekday - date.weekday()) % 7
-    return date + dt.timedelta(days=days + 7 * (nth - 1))
-
-
-def last_weekday(year: int, month: int, weekday: int) -> dt.date:
-    if month == 12:
-        date = dt.date(year + 1, 1, 1) - dt.timedelta(days=1)
-    else:
-        date = dt.date(year, month + 1, 1) - dt.timedelta(days=1)
-    return date - dt.timedelta(days=(date.weekday() - weekday) % 7)
-
-
-def observed_fixed_holiday(year: int, month: int, day: int) -> dt.date:
-    holiday = dt.date(year, month, day)
-    if holiday.weekday() == 5:
-        return holiday - dt.timedelta(days=1)
-    if holiday.weekday() == 6:
-        return holiday + dt.timedelta(days=1)
-    return holiday
-
-
-def us_market_holidays(year: int) -> set[dt.date]:
-    return {
-        observed_fixed_holiday(year, 1, 1),
-        nth_weekday(year, 1, 0, 3),
-        nth_weekday(year, 2, 0, 3),
-        last_weekday(year, 5, 0),
-        observed_fixed_holiday(year, 6, 19),
-        observed_fixed_holiday(year, 7, 4),
-        nth_weekday(year, 9, 0, 1),
-        nth_weekday(year, 10, 0, 2),
-        observed_fixed_holiday(year, 11, 11),
-        nth_weekday(year, 11, 3, 4),
-        observed_fixed_holiday(year, 12, 25),
-    }
-
-
-def is_business_day(date: dt.date, holidays: set[dt.date]) -> bool:
-    return date.weekday() < 5 and date not in holidays
-
-
-def lds_row(rows: list[GasRow]) -> GasRow | None:
-    if not rows:
-        return None
-    holidays = us_market_holidays(rows[0].price_date.year)
-    business_rows = [row for row in rows if is_business_day(row.price_date, holidays)]
-    if len(business_rows) < 3:
-        return None
-    return business_rows[-3]
-
-
-def latest_value(rows: list[GasRow], attr: str) -> tuple[GasRow, float] | None:
-    for row in reversed(rows):
-        value = getattr(row, attr)
-        if value is not None:
-            return row, value
-    return None
-
-
-def clean_values(values: list[float | None]) -> list[float]:
-    return [value for value in values if value is not None]
-
-
-def fmt(value: float | None) -> str:
-    return "-" if value is None else f"{value:.3f}"
-
-
-def load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
-    ]
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size=size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def draw_text(
-    draw: ImageDraw.ImageDraw,
-    xy: tuple[int, int],
-    text: str,
-    font: ImageFont.ImageFont,
-    fill: str,
-    anchor: str | None = None,
-) -> None:
-    draw.text(xy, text, font=font, fill=fill, anchor=anchor)
-
-
-def draw_dashed_line(
-    draw: ImageDraw.ImageDraw,
-    start: tuple[float, float],
-    end: tuple[float, float],
-    fill: str,
-    width: int,
-    dash: int = 14,
-    gap: int = 10,
-) -> None:
-    x1, y1 = start
-    x2, y2 = end
-    length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-    if length == 0:
+def label_last(ax, xs, ys, color, fmt="{:.2f}", dy=8):
+    """가장 최근(마지막) 데이터 지점에 값 라벨 표시."""
+    if not xs or not ys:
         return
-    dx = (x2 - x1) / length
-    dy = (y2 - y1) / length
-    distance = 0.0
-    while distance < length:
-        segment_end = min(distance + dash, length)
-        sx = x1 + dx * distance
-        sy = y1 + dy * distance
-        ex = x1 + dx * segment_end
-        ey = y1 + dy * segment_end
-        draw.line((sx, sy, ex, ey), fill=fill, width=width)
-        distance += dash + gap
-
-
-def render_chart(rows: list[GasRow], month: str) -> bytes:
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"No rows found for {month}.")
-
-    dates = [row.price_date for row in rows]
-    nymex = [row.nymex_price for row in rows]
-    katy = [row.katy_price for row in rows]
-    hsc = [row.hsc_monthly_price for row in rows]
-
-    latest_nymex = latest_value(rows, "nymex_price")
-    latest_katy = latest_value(rows, "katy_price")
-    lds = lds_row(rows)
-    holidays = us_market_holidays(dates[0].year)
-
-    month_label = dates[0].strftime("%B %Y")
-    strip_dates = sorted(
-        {
-            row.nymex_strip_date.isoformat()
-            for row in rows
-            if row.nymex_strip_date and row.nymex_price is not None
-        }
-    )
-    strip_label = ", ".join(strip_dates) or "N/A"
-    latest_parts = []
-    if latest_nymex:
-        latest_parts.append(f"NYMEX through {latest_nymex[0].price_date:%b %d}")
-    if latest_katy:
-        latest_parts.append(f"Katy through {latest_katy[0].price_date:%b %d}")
-
-    width, height = 1920, 1080
-    margin_left, margin_right = 120, 50
-    margin_top, margin_bottom = 150, 125
-    plot_left = margin_left
-    plot_right = width - margin_right
-    plot_top = margin_top
-    plot_bottom = height - margin_bottom
-    plot_width = plot_right - plot_left
-    plot_height = plot_bottom - plot_top
-
-    image = Image.new("RGB", (width, height), "#ffffff")
-    draw = ImageDraw.Draw(image)
-
-    font_title = load_font(42, bold=True)
-    font_body = load_font(24)
-    font_small = load_font(20)
-    font_axis = load_font(22)
-    font_legend = load_font(24)
-    font_label_bold = load_font(22, bold=True)
-
-    all_values = clean_values(nymex + katy + hsc)
-    if not all_values:
-        value_min, value_max = 0.0, 1.0
-    else:
-        value_min = min(all_values)
-        value_max = max(all_values)
-        if value_min == value_max:
-            value_min -= 0.5
-            value_max += 0.5
-        padding = max((value_max - value_min) * 0.2, 0.1)
-        value_min -= padding
-        value_max += padding
-
-    def x_for(index: int) -> float:
-        if len(dates) <= 1:
-            return plot_left
-        return plot_left + index * plot_width / (len(dates) - 1)
-
-    def y_for(value: float) -> float:
-        return plot_bottom - ((value - value_min) / (value_max - value_min)) * plot_height
-
-    # Weekend and holiday shading.
-    for index, date in enumerate(dates):
-        if date.weekday() >= 5 or date in holidays:
-            day_width = plot_width / max(len(dates) - 1, 1)
-            left = int(x_for(index) - day_width / 2)
-            right = int(x_for(index) + day_width / 2)
-            draw.rectangle(
-                (max(plot_left, left), plot_top, min(plot_right, right), plot_bottom),
-                fill="#e5e7eb",
-            )
-
-    # Grid and frame.
-    for step in range(6):
-        y = plot_bottom - step * plot_height / 5
-        value = value_min + step * (value_max - value_min) / 5
-        draw.line((plot_left, y, plot_right, y), fill="#d7dde5", width=1)
-        draw_text(draw, (plot_left - 18, int(y)), f"{value:.2f}", font_axis, "#1f2937", anchor="rm")
-
-    tick_positions = list(range(0, len(dates), 2))
-    if (len(dates) - 1) not in tick_positions:
-        tick_positions.append(len(dates) - 1)
-    for index in tick_positions:
-        x = x_for(index)
-        draw.line((x, plot_top, x, plot_bottom), fill="#e1e7ef", width=1)
-        draw_text(
-            draw,
-            (int(x), plot_bottom + 28),
-            dates[index].strftime("%b %d"),
-            font_axis,
-            "#1f2937",
-            anchor="mm",
-        )
-
-    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill="#c7ccd4", width=2)
-    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill="#c7ccd4", width=2)
-
-    def draw_series(values: list[float | None], color: str, dashed: bool = False, markers: bool = True) -> None:
-        prev: tuple[float, float] | None = None
-        for index, value in enumerate(values):
-            if value is None:
-                prev = None
-                continue
-            point = (x_for(index), y_for(value))
-            if prev is not None:
-                if dashed:
-                    draw_dashed_line(draw, prev, point, color, 5)
-                else:
-                    draw.line((*prev, *point), fill=color, width=6)
-            if markers:
-                x, y = point
-                draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color, outline=color)
-            prev = point
-
-    draw_series(nymex, "#1f6f8b")
-    draw_series(katy, "#c75000")
-    draw_series(hsc, "#5b5f97", dashed=True, markers=False)
-
-    if lds and lds.nymex_price is not None:
-        lds_index = dates.index(lds.price_date)
-        x = x_for(lds_index)
-        y = y_for(lds.nymex_price)
-        draw.ellipse((x - 14, y - 14, x + 14, y + 14), fill="#ffd166", outline="#7c2d12", width=5)
-        draw_text(
-            draw,
-            (int(min(x + 18, plot_right - 130)), int(max(y - 46, plot_top + 8))),
-            f"LDS {lds.price_date:%b %d}\n{lds.nymex_price:.3f}",
-            font_label_bold,
-            "#7c2d12",
-        )
-
-    # Titles and labels.
-    draw_text(draw, (width // 2, 42), f"LAI Database Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
-    subtitle = f"NYMEX front strip: {strip_label}. {'; '.join(latest_parts)}. Blank dates indicate no value returned from DB."
-    draw_text(draw, (plot_left, 96), subtitle, font_body, "#4b5563")
-    draw_text(draw, (plot_left - 72, (plot_top + plot_bottom) // 2), "Price", font_body, "#24272d", anchor="mm")
-    draw_text(draw, ((plot_left + plot_right) // 2, height - 30), "Price date", font_body, "#24272d", anchor="mm")
-
-    # Legend.
-    legend_x, legend_y = plot_left + 12, plot_top + 18
-    legend_items = [
-        ("#1f6f8b", "GM_NYMEX_new Price (front strip)", False),
-        ("#c75000", "GM_RegionalPrice RegionalPrice_Katy", False),
-        ("#5b5f97", "GM_RegionalPriceMonthly RegionalPrice_HoustonShipChl", True),
-    ]
-    if lds and lds.nymex_price is not None:
-        legend_items.append(("#ffd166", "NYMEX LDS (last business day D-2)", False))
-    box_w, box_h = 610, 38 + len(legend_items) * 36
-    draw.rounded_rectangle((legend_x, legend_y, legend_x + box_w, legend_y + box_h), radius=8, fill="#ffffff", outline="#d4d0c8", width=2)
-    y_cursor = legend_y + 24
-    for color, label, dashed in legend_items:
-        if label.startswith("NYMEX LDS"):
-            draw.ellipse((legend_x + 20, y_cursor - 10, legend_x + 40, y_cursor + 10), fill=color, outline="#7c2d12", width=3)
-        elif dashed:
-            draw_dashed_line(draw, (legend_x + 18, y_cursor), (legend_x + 54, y_cursor), color, 5)
-        else:
-            draw.line((legend_x + 18, y_cursor, legend_x + 54, y_cursor), fill=color, width=6)
-            draw.ellipse((legend_x + 32, y_cursor - 6, legend_x + 44, y_cursor + 6), fill=color)
-        draw_text(draw, (legend_x + 72, y_cursor - 13), label, font_legend, "#24272d")
-        y_cursor += 36
-
-    output = io.BytesIO()
-    image.save(output, format="PNG")
-    return output.getvalue()
-
-
-@app.get("/")
-def root() -> dict[str, str]:
-    return {"service": APP_TITLE, "chart": "/chart.png?month=current", "health": "/health"}
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.get("/debug-sheet")
-def debug_sheet() -> JSONResponse:
-    return JSONResponse(fetch_sheet_preview())
-
-
-@app.get("/chart-info")
-def chart_info(month: str | None = Query(default="current")) -> JSONResponse:
-    rows = fetch_sheet_rows()
-    selected_month = choose_month(rows, month)
-    month_rows = calendar_rows(rows, selected_month)
-    lds = lds_row(month_rows)
-    latest_nymex = latest_value(month_rows, "nymex_price")
-    latest_katy = latest_value(month_rows, "katy_price")
-    return JSONResponse(
-        {
-            "month": selected_month,
-            "row_count": len(month_rows),
-            "latest_nymex_date": latest_nymex[0].price_date.isoformat() if latest_nymex else None,
-            "latest_nymex_price": latest_nymex[1] if latest_nymex else None,
-            "latest_katy_date": latest_katy[0].price_date.isoformat() if latest_katy else None,
-            "latest_katy_price": latest_katy[1] if latest_katy else None,
-            "lds_date": lds.price_date.isoformat() if lds else None,
-            "lds_price": lds.nymex_price if lds else None,
-        }
+    x, y = xs[-1], ys[-1]
+    ax.annotate(
+        fmt.format(y), xy=(x, y), xytext=(0, dy),
+        textcoords="offset points", ha="center", va="bottom",
+        fontsize=10, fontweight="bold", color=color,
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=color, lw=1, alpha=0.9),
     )
 
 
-@app.get("/chart-check")
-def chart_check(month: str | None = Query(default="current")) -> JSONResponse:
-    rows = fetch_sheet_rows()
-    selected_month = choose_month(rows, month)
-    month_rows = calendar_rows(rows, selected_month)
-    nymex_count = sum(1 for row in month_rows if row.nymex_price is not None)
-    katy_count = sum(1 for row in month_rows if row.katy_price is not None)
-    hsc_count = sum(1 for row in month_rows if row.hsc_monthly_price is not None)
+def fig_to_png(fig):
+    # 제목/축 라벨 공간을 명시적 여백으로 확보 (bbox_inches="tight"는
+    # py3.14에서 재귀를 유발하므로 사용하지 않음). 범례는 축 안쪽에 있음.
+    fig.subplots_adjust(top=0.88, bottom=0.12, left=0.09, right=0.97)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ── 데이터 파싱 ──────────────────────────────────────────────────
+def parse_gas(rows, ym):
+    """Gas 시트 → 당월 NYMEX(일별), Katy(일별), HSC(월)."""
+    # 컬럼: PriceDate | NYMEX_StripDate | NYMEX_Price | NYMEX_RowCount | RegionalPrice_Katy | RegionalPrice_HoustonShipChl_Monthly
+    nymex, katy, hsc = {}, {}, None
+    prev_nymex_vals = []  # 전월 NYMEX 값 (LDS 계산용)
+    prev_ym = prev_month(ym)
+
+    for row in rows[1:]:
+        if not row or len(row) < 3:
+            continue
+        pdate = str(row[0])[:10] if row[0] else ""
+        if len(pdate) < 10:
+            continue
+        row_ym = pdate[:7]
+        day = int(pdate[8:10])
+        nv = to_float(row[2]) if len(row) > 2 else None
+        kv = to_float(row[4]) if len(row) > 4 else None
+        hv = to_float(row[5]) if len(row) > 5 else None
+
+        if row_ym == ym:
+            if nv is not None:
+                nymex[day] = nv
+            if kv is not None:
+                katy[day] = kv
+            if hv is not None:
+                hsc = hv
+        elif row_ym == prev_ym and nv is not None:
+            prev_nymex_vals.append((day, nv))
+
+    # 전월 마지막 3거래일 평균 (LDS)
+    prev_nymex_vals.sort()
+    last3 = [v for _, v in prev_nymex_vals[-3:]]
+    prev_lds = sum(last3) / len(last3) if last3 else None
+
+    return nymex, katy, hsc, prev_lds
+
+
+def parse_power(rows, ym):
+    """Power 시트 → 당월 일별 DA/RT 평균 + 일별 Peak Load / Peak시점 NetLoad."""
+    # 컬럼: DateTime | Date | Hour | DAM | RTM | Demand | WindProduction | SolarProduction | Netload | UpdatedAt
+    days = {}  # date -> {'DAM':[], 'RTM':[], 'LOAD':{h:v}, 'NL':{h:v}}
+    for row in rows[1:]:
+        if not row or len(row) < 9:
+            continue
+        dstr = str(row[1])[:10] if row[1] else ""
+        if len(dstr) < 10 or dstr[:7] != ym:
+            continue
+        try:
+            hour = int(row[2])
+        except (ValueError, TypeError):
+            continue
+        if not (0 <= hour <= 23):
+            continue
+        d = days.setdefault(dstr, {"DAM": [], "RTM": [], "LOAD": {}, "NL": {}})
+        dam = to_float(row[3])
+        rtm = to_float(row[4])
+        dem = to_float(row[5])
+        nl = to_float(row[8])
+        if dam is not None:
+            d["DAM"].append(dam)
+        if rtm is not None:
+            d["RTM"].append(rtm)
+        if dem is not None:
+            d["LOAD"][hour] = dem / 1000.0  # MW → GW
+        if nl is not None:
+            d["NL"][hour] = nl / 1000.0
+
+    # 일별 집계
+    dam_daily, rtm_daily, peak_daily, nl_at_peak = {}, {}, {}, {}
+    for dstr, d in days.items():
+        day = int(dstr[8:10])
+        if d["DAM"]:
+            dam_daily[day] = sum(d["DAM"]) / len(d["DAM"])
+        if d["RTM"]:
+            rtm_daily[day] = sum(d["RTM"]) / len(d["RTM"])
+        if d["LOAD"]:
+            peak_hour = max(d["LOAD"], key=d["LOAD"].get)
+            peak_daily[day] = d["LOAD"][peak_hour]
+            nl_at_peak[day] = d["NL"].get(peak_hour)
+    return dam_daily, rtm_daily, peak_daily, nl_at_peak
+
+
+def prev_month(ym):
+    y, m = map(int, ym.split("-"))
+    m -= 1
+    if m == 0:
+        y -= 1
+        m = 12
+    return f"{y}-{m:02d}"
+
+
+def dict_to_series(d, ndays=31):
+    """{day: val} → (x일리스트, y값리스트), 값 없는 날 제외."""
+    xs = sorted(d.keys())
+    ys = [d[x] for x in xs]
+    return xs, ys
+
+
+# ── 차트 생성 ────────────────────────────────────────────────────
+def chart_nymex(ym):
+    rows = fetch_sheet("Gas")
+    nymex, _, _, prev_lds = parse_gas(rows, ym)
+    xs, ys = dict_to_series(nymex)
+
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    if xs:
+        ax.plot(xs, ys, color=C_SKY, lw=2, marker="o", ms=4,
+                mfc="white", mec=C_SKY, mew=1.4, label="NYMEX Daily")
+        label_last(ax, xs, ys, C_SKY, fmt="{:.3f}")
+    if prev_lds is not None:
+        ax.axhline(prev_lds, color=C_SKY, lw=1.5, ls="--", alpha=0.7,
+                   label=f"NYMEX LDS ({prev_lds:.3f})")
+    fig.suptitle(f"NYMEX Daily Price — {month_label(ym)}",
+                 fontsize=14, fontweight="bold", color=C_TEXT, x=0.09, ha="left", y=0.97)
+    if xs:
+        ax.xaxis.set_major_locator(FixedLocator([float(x) for x in xs]))
+        ax.tick_params(axis="x", labelsize=8)
+    ax.set_xlabel("Day")
+    lds_label = f"NYMEX LDS ({prev_lds:.3f})" if prev_lds is not None else "NYMEX LDS"
+    style_axes(ax, "$/MMBtu", legend_items=[
+        ("NYMEX Daily", C_SKY, False),
+        (lds_label, C_SKY, True),
+    ])
+    return fig_to_png(fig)
+
+
+def chart_hsc_katy(ym):
+    rows = fetch_sheet("Gas")
+    _, katy, hsc, _ = parse_gas(rows, ym)
+    xs, ys = dict_to_series(katy)
+
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    if xs:
+        ax.plot(xs, ys, color=C_CYAN, lw=2, marker="o", ms=4,
+                mfc="white", mec=C_CYAN, mew=1.4, label="Katy GD Daily")
+        label_last(ax, xs, ys, C_CYAN, fmt="{:.3f}")
+    if hsc is not None:
+        ax.axhline(hsc, color=C_NAVY, lw=2.5, label=f"HSC Monthly ({hsc:.3f})")
+    fig.suptitle(f"IFERC HSC vs GD Katy — {month_label(ym)}",
+                 fontsize=14, fontweight="bold", color=C_TEXT, x=0.09, ha="left", y=0.97)
+    if xs:
+        ax.xaxis.set_major_locator(FixedLocator([float(x) for x in xs]))
+        ax.tick_params(axis="x", labelsize=8)
+    ax.set_xlabel("Day")
+    hsc_label = f"HSC Monthly ({hsc:.3f})" if hsc is not None else "HSC Monthly"
+    style_axes(ax, "$/MMBtu", legend_items=[
+        ("Katy GD Daily", C_CYAN, False),
+        (hsc_label, C_NAVY, False),
+    ])
+    return fig_to_png(fig)
+
+
+def chart_power_dart(ym):
+    rows = fetch_sheet("Power")
+    dam_daily, rtm_daily, _, _ = parse_power(rows, ym)
+    xd, yd = dict_to_series(dam_daily)
+    xr, yr = dict_to_series(rtm_daily)
+
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    if xd:
+        ax.plot(xd, yd, color=C_SKY, lw=2, marker="o", ms=3.5,
+                mfc="white", mec=C_SKY, mew=1.4, label="DAM")
+        label_last(ax, xd, yd, C_SKY, fmt="{:.1f}", dy=-18)
+    if xr:
+        ax.plot(xr, yr, color=C_PURPLE, lw=2, marker="o", ms=3.5,
+                mfc="white", mec=C_PURPLE, mew=1.4, label="RTM")
+        label_last(ax, xr, yr, C_PURPLE, fmt="{:.1f}", dy=8)
+    fig.suptitle(f"ERCOT Daily DA / RT — {month_label(ym)}",
+                 fontsize=14, fontweight="bold", color=C_TEXT, x=0.09, ha="left", y=0.97)
+    ax.xaxis.set_major_locator(MultipleLocator(1))
+    ax.tick_params(axis="x", labelsize=8)
+    ax.set_xlabel("Day")
+    style_axes(ax, "$/MWh", legend_items=[
+        ("DAM", C_SKY, False),
+        ("RTM", C_PURPLE, False),
+    ])
+    return fig_to_png(fig)
+
+
+def chart_power_peak(ym):
+    rows = fetch_sheet("Power")
+    _, _, peak_daily, nl_at_peak = parse_power(rows, ym)
+    xp, yp = dict_to_series(peak_daily)
+    xn, yn = dict_to_series(nl_at_peak)
+
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    if xp:
+        ax.plot(xp, yp, color=C_RED, lw=2, marker="o", ms=3.5,
+                mfc="white", mec=C_RED, mew=1.4, label="Peak Load")
+        label_last(ax, xp, yp, C_RED, fmt="{:.1f}", dy=8)
+    if xn:
+        ax.plot(xn, yn, color=C_PURPLE, lw=2, ls="--", marker="o", ms=3.5,
+                mfc="white", mec=C_PURPLE, mew=1.4, label="Net Load @ Peak")
+        label_last(ax, xn, yn, C_PURPLE, fmt="{:.1f}", dy=-18)
+    fig.suptitle(f"Daily Peak Load & Net Load — {month_label(ym)}",
+                 fontsize=14, fontweight="bold", color=C_TEXT, x=0.09, ha="left", y=0.97)
+    ax.xaxis.set_major_locator(MultipleLocator(1))
+    ax.tick_params(axis="x", labelsize=8)
+    ax.set_xlabel("Day")
+    style_axes(ax, "GW", legend_items=[
+        ("Peak Load", C_RED, False),
+        ("Net Load @ Peak", C_PURPLE, True),
+    ])
+    return fig_to_png(fig)
+
+
+CHARTS = {
+    "nymex": ("nymex_daily", chart_nymex),
+    "hsc_katy": ("hsc_vs_katy", chart_hsc_katy),
+    "power_dart": ("power_daily_dart", chart_power_dart),
+    "power_peak": ("power_daily_peak", chart_power_peak),
+}
+
+
+# ── 라우트 ──────────────────────────────────────────────────────
+@app.route("/")
+def health():
+    import matplotlib
+    return jsonify({
+        "status": "ok",
+        "service": "energy-price-charts",
+        "python": sys.version.split()[0],
+        "matplotlib": matplotlib.__version__,
+        "endpoints": [f"/chart/{k}" for k in CHARTS] + ["/chart/all"],
+        "month_default": current_month(),
+    })
+
+
+@app.route("/chart/<name>")
+def chart(name):
+    ym = request.args.get("month", current_month())
     try:
-        render_chart(month_rows, selected_month)
-        render_status = "ok"
-        render_error = None
-    except Exception as exc:
-        render_status = "error"
-        render_error = f"{type(exc).__name__}: {exc}"
+        datetime.strptime(ym, "%Y-%m")
+    except ValueError:
+        return jsonify({"error": "month must be YYYY-MM"}), 400
 
-    return JSONResponse(
-        {
-            "month": selected_month,
-            "sheet_row_count": len(rows),
-            "calendar_row_count": len(month_rows),
-            "nymex_count": nymex_count,
-            "katy_count": katy_count,
-            "hsc_count": hsc_count,
-            "render_status": render_status,
-            "render_error": render_error,
-        }
-    )
+    if name == "all":
+        return chart_all(ym)
 
+    if name not in CHARTS:
+        return jsonify({"error": f"unknown chart '{name}'",
+                        "available": list(CHARTS)}), 404
 
-@app.get("/chart.png")
-def chart_png(month: str | None = Query(default="current")) -> Response:
-    rows = fetch_sheet_rows()
-    selected_month = choose_month(rows, month)
-    month_rows = calendar_rows(rows, selected_month)
+    fname, fn = CHARTS[name]
     try:
-        png = render_chart(month_rows, selected_month)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Chart rendering failed: {type(exc).__name__}: {exc}",
-        ) from exc
-    filename = f"lai-gas-price-trend-{selected_month}.png"
-    return Response(
-        content=png,
-        media_type="image/png",
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
-    )
+        png = fn(ym)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc().splitlines()
+        # app.py 프레임만 추출 (재귀 유발 지점 확인용)
+        app_frames = [ln.strip() for ln in tb if "app.py" in ln]
+        return jsonify({
+            "error": str(e),
+            "type": type(e).__name__,
+            "app_frames": app_frames[:12],
+            "tail": tb[-6:],
+        }), 500
+    return send_file(png, mimetype="image/png",
+                     download_name=f"{fname}_{ym}.png")
+
+
+def chart_all(ym):
+    """4개 차트를 zip으로 묶어 반환."""
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, (fname, fn) in CHARTS.items():
+            try:
+                png = fn(ym)
+                zf.writestr(f"{fname}_{ym}.png", png.read())
+            except Exception as e:
+                zf.writestr(f"{fname}_ERROR.txt", str(e))
+    mem.seek(0)
+    return send_file(mem, mimetype="application/zip",
+                     download_name=f"energy_charts_{ym}.zip")
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
