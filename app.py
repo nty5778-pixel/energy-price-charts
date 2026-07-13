@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 APP_TITLE = "LAI Gas Chart API"
+APP_VERSION = "2026-07-12-split-panels-v2"
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 DEFAULT_SHEET_ID = "1g-yuKuUhSd3nU7eDiLWFgxOcbuFkBWmWH0wZvGg6B9I"
 DEFAULT_SHEET_GID = "0"
@@ -350,10 +351,10 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     if latest_katy:
         latest_parts.append(f"Katy through {latest_katy[0].price_date:%b %d}")
 
-    width, height = 1920, 1280
+    width, height = 1920, 1380
     plot_left, plot_right = 120, width - 50
-    panel1_top, panel1_bottom = 165, 600
-    panel2_top, panel2_bottom = 760, 1160
+    panel1_top, panel1_bottom = 245, 665
+    panel2_top, panel2_bottom = 880, 1270
     plot_width = plot_right - plot_left
     image = Image.new("RGB", (width, height), "#ffffff")
     draw = ImageDraw.Draw(image)
@@ -378,6 +379,7 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     draw_text(draw, (width // 2, 42), f"LAI Database Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
     subtitle = f"NYMEX front strip: {strip_label}. {'; '.join(latest_parts)}. Blank dates indicate no value returned from DB."
     draw_text(draw, (plot_left, 96), subtitle, font_body, "#4b5563")
+    draw_text(draw, (plot_right, 96), APP_VERSION, font_small, "#9b9892", anchor="ra")
 
     def draw_panel(
         title: str,
@@ -388,7 +390,8 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
         show_x_labels: bool,
         lds_marker: GasRow | None = None,
     ) -> None:
-        legend_x, legend_y = plot_right - 670, top - 72
+        header_y = top - 70
+        legend_x, legend_y = plot_right - 670, header_y - 8
         legend_width = 660
         legend_height = 44
         draw.rounded_rectangle(
@@ -434,8 +437,8 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
         def y_for(value: float) -> float:
             return bottom - ((value - value_min) / (value_max - value_min)) * panel_height
 
-        draw_text(draw, (plot_left, top - 54), title, font_label_bold, "#24272d")
-        draw_text(draw, (plot_left, top - 26), subtitle_text, font_small, "#6b7280")
+        draw_text(draw, (plot_left, header_y), title, font_label_bold, "#24272d")
+        draw_text(draw, (plot_left, header_y + 28), subtitle_text, font_small, "#6b7280")
 
         for index, date in enumerate(dates):
             if date.weekday() >= 5 or date in holidays:
@@ -542,12 +545,17 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": APP_TITLE, "chart": "/chart.png?month=current", "health": "/health"}
+    return {"service": APP_TITLE, "version": APP_VERSION, "chart": "/chart.png?month=current", "health": "/health"}
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
+
+
+@app.get("/version")
+def version() -> dict[str, str]:
+    return {"version": APP_VERSION}
 
 
 @app.get("/debug-sheet")
