@@ -19,6 +19,7 @@ APP_VERSION = "2026-07-12-split-panels-v2"
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 DEFAULT_SHEET_ID = "1g-yuKuUhSd3nU7eDiLWFgxOcbuFkBWmWH0wZvGg6B9I"
 DEFAULT_SHEET_GID = "0"
+DEFAULT_POWER_SHEET_NAME = "Power"
 
 
 app = FastAPI(title=APP_TITLE)
@@ -34,6 +35,28 @@ class GasRow:
     updated_at: str
 
 
+@dataclass
+class PowerHourlyRow:
+    date_time: str
+    date: dt.date
+    hour: int | None
+    dam: float | None
+    rtm: float | None
+    demand: float | None
+    wind_production: float | None
+    solar_production: float | None
+    net_load: float | None
+    updated_at: str
+
+
+@dataclass
+class PowerDailyRow:
+    date: dt.date
+    dam_avg: float | None
+    rtm_avg: float | None
+    sample_count: int
+
+
 def sheet_csv_url() -> str:
     explicit_url = os.getenv("GOOGLE_SHEET_CSV_URL", "").strip()
     if explicit_url:
@@ -45,20 +68,39 @@ def sheet_csv_url() -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?{query}"
 
 
-def fetch_sheet_rows() -> list[GasRow]:
+def power_sheet_csv_url() -> str:
+    explicit_url = os.getenv("GOOGLE_POWER_SHEET_CSV_URL", "").strip()
+    if explicit_url:
+        return explicit_url
+
+    sheet_id = os.getenv("GOOGLE_SHEET_ID", DEFAULT_SHEET_ID).strip()
+    sheet_gid = os.getenv("GOOGLE_POWER_SHEET_GID", "").strip()
+    if sheet_gid:
+        query = urllib.parse.urlencode({"format": "csv", "gid": sheet_gid})
+        return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?{query}"
+
+    sheet_name = os.getenv("GOOGLE_POWER_SHEET_NAME", DEFAULT_POWER_SHEET_NAME).strip()
+    query = urllib.parse.urlencode({"tqx": "out:csv", "sheet": sheet_name})
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?{query}"
+
+
+def fetch_csv_text(url: str) -> str:
     request = urllib.request.Request(
-        sheet_csv_url(),
+        url,
         headers={"User-Agent": "LAI-Gas-Chart-API/1.0"},
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8-sig")
+            return response.read().decode("utf-8-sig")
     except Exception as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Could not read Google Sheet CSV. Check sharing/publish access. {exc}",
         ) from exc
 
+
+def fetch_sheet_rows() -> list[GasRow]:
+    raw = fetch_csv_text(sheet_csv_url())
     reader = csv.DictReader(io.StringIO(raw))
     rows: list[GasRow] = []
     for source in reader:
@@ -91,19 +133,7 @@ def fetch_sheet_rows() -> list[GasRow]:
 
 
 def fetch_sheet_preview() -> dict[str, object]:
-    request = urllib.request.Request(
-        sheet_csv_url(),
-        headers={"User-Agent": "LAI-Gas-Chart-API/1.0"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8-sig")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not read Google Sheet CSV. Check sharing/publish access. {exc}",
-        ) from exc
-
+    raw = fetch_csv_text(sheet_csv_url())
     reader = csv.DictReader(io.StringIO(raw))
     sample_rows = []
     for index, row in enumerate(reader):
@@ -113,6 +143,52 @@ def fetch_sheet_preview() -> dict[str, object]:
 
     return {
         "csv_url": sheet_csv_url(),
+        "headers": reader.fieldnames or [],
+        "sample_rows": sample_rows,
+    }
+
+
+def fetch_power_rows() -> list[PowerHourlyRow]:
+    raw = fetch_csv_text(power_sheet_csv_url())
+    reader = csv.DictReader(io.StringIO(raw))
+    rows: list[PowerHourlyRow] = []
+    for source in reader:
+        date = parse_date(pick(source, "Date", "PriceDate", "date"))
+        date_time = pick(source, "DateTime", "Datetime", "Date Time", "Dates")
+        if date is None and date_time:
+            date = parse_date(date_time)
+        if date is None:
+            continue
+
+        rows.append(
+            PowerHourlyRow(
+                date_time=date_time,
+                date=date,
+                hour=parse_int(pick(source, "Hour", "HE", "hour")),
+                dam=parse_float(pick(source, "DAM", "DA", "DA_Price")),
+                rtm=parse_float(pick(source, "RTM", "RT", "RT_Price")),
+                demand=parse_float(pick(source, "Demand")),
+                wind_production=parse_float(pick(source, "WindProduction", "Wind")),
+                solar_production=parse_float(pick(source, "SolarProduction", "Solar")),
+                net_load=parse_float(pick(source, "NetLoad")),
+                updated_at=source.get("UpdatedAt", "") or "",
+            )
+        )
+
+    return sorted(rows, key=lambda row: (row.date, row.hour if row.hour is not None else 99, row.date_time))
+
+
+def fetch_power_preview() -> dict[str, object]:
+    raw = fetch_csv_text(power_sheet_csv_url())
+    reader = csv.DictReader(io.StringIO(raw))
+    sample_rows = []
+    for index, row in enumerate(reader):
+        if index >= 5:
+            break
+        sample_rows.append(row)
+
+    return {
+        "csv_url": power_sheet_csv_url(),
         "headers": reader.fieldnames or [],
         "sample_rows": sample_rows,
     }
@@ -150,6 +226,18 @@ def parse_float(value: str | None) -> float | None:
         return None
 
 
+def parse_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
 def current_month() -> str:
     today = dt.datetime.now(CENTRAL_TZ).date()
     return f"{today.year:04d}-{today.month:02d}"
@@ -166,6 +254,20 @@ def choose_month(rows: list[GasRow], requested_month: str | None) -> str:
     months = sorted({row.price_date.strftime("%Y-%m") for row in rows})
     if not months:
         raise HTTPException(status_code=404, detail="No dated rows were found in the sheet.")
+    return months[-1]
+
+
+def choose_power_month(rows: list[PowerHourlyRow], requested_month: str | None) -> str:
+    if requested_month and requested_month.lower() != "current":
+        return requested_month[:7]
+
+    month = current_month()
+    if any(row.date.strftime("%Y-%m") == month for row in rows):
+        return month
+
+    months = sorted({row.date.strftime("%Y-%m") for row in rows})
+    if not months:
+        raise HTTPException(status_code=404, detail="No dated power rows were found in the sheet.")
     return months[-1]
 
 
@@ -196,6 +298,31 @@ def calendar_rows(rows: list[GasRow], month: str) -> list[GasRow]:
                     hsc_monthly_price=None,
                     updated_at="",
                 ),
+            )
+        )
+        cursor += dt.timedelta(days=1)
+    return result
+
+
+def power_daily_rows(rows: list[PowerHourlyRow], month: str) -> list[PowerDailyRow]:
+    start, end = month_bounds(month)
+    grouped: dict[dt.date, list[PowerHourlyRow]] = {}
+    for row in rows:
+        if start <= row.date < end:
+            grouped.setdefault(row.date, []).append(row)
+
+    result: list[PowerDailyRow] = []
+    cursor = start
+    while cursor < end:
+        day_rows = grouped.get(cursor, [])
+        dam_values = [row.dam for row in day_rows if row.dam is not None]
+        rtm_values = [row.rtm for row in day_rows if row.rtm is not None]
+        result.append(
+            PowerDailyRow(
+                date=cursor,
+                dam_avg=average(dam_values),
+                rtm_avg=average(rtm_values),
+                sample_count=len(day_rows),
             )
         )
         cursor += dt.timedelta(days=1)
@@ -265,6 +392,10 @@ def latest_value(rows: list[GasRow], attr: str) -> tuple[GasRow, float] | None:
 
 def clean_values(values: list[float | None]) -> list[float]:
     return [value for value in values if value is not None]
+
+
+def average(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
 
 
 def fmt(value: float | None) -> str:
@@ -379,7 +510,7 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     draw_text(draw, (width // 2, 42), f"LAI Database Gas Price Trend - {month_label}", font_title, "#24272d", anchor="ma")
     subtitle = f"NYMEX front strip: {strip_label}. {'; '.join(latest_parts)}. Blank dates indicate no value returned from DB."
     draw_text(draw, (plot_left, 96), subtitle, font_body, "#4b5563")
-    draw_text(draw, (plot_right, 96), APP_VERSION, font_small, "#9b9892", anchor="ra")
+    draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
 
     def draw_panel(
         title: str,
@@ -543,9 +674,140 @@ def render_chart(rows: list[GasRow], month: str) -> bytes:
     return output.getvalue()
 
 
+def render_power_chart(rows: list[PowerDailyRow], month: str) -> bytes:
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No power rows found for {month}.")
+
+    dates = [row.date for row in rows]
+    dam = [row.dam_avg for row in rows]
+    rtm = [row.rtm_avg for row in rows]
+    valid_values = clean_values(dam + rtm)
+    month_label = dates[0].strftime("%B %Y")
+    latest_da = next((row for row in reversed(rows) if row.dam_avg is not None), None)
+    latest_rt = next((row for row in reversed(rows) if row.rtm_avg is not None), None)
+    holidays = us_market_holidays(dates[0].year)
+
+    width, height = 1920, 980
+    plot_left, plot_right = 120, width - 50
+    plot_top, plot_bottom = 210, 850
+    plot_width = plot_right - plot_left
+    plot_height = plot_bottom - plot_top
+
+    image = Image.new("RGB", (width, height), "#ffffff")
+    draw = ImageDraw.Draw(image)
+
+    font_title = load_font(42, bold=True)
+    font_body = load_font(24)
+    font_small = load_font(20)
+    font_axis = load_font(22)
+    font_legend = load_font(24)
+    font_label_bold = load_font(22, bold=True)
+
+    if not valid_values:
+        value_min, value_max = 0.0, 1.0
+    else:
+        value_min = min(valid_values)
+        value_max = max(valid_values)
+        if value_min == value_max:
+            value_min -= 5.0
+            value_max += 5.0
+        padding = max((value_max - value_min) * 0.18, 5.0)
+        value_min -= padding
+        value_max += padding
+
+    def x_for(index: int) -> float:
+        if len(dates) <= 1:
+            return float(plot_left)
+        return plot_left + index * plot_width / (len(dates) - 1)
+
+    def y_for(value: float) -> float:
+        return plot_bottom - ((value - value_min) / (value_max - value_min)) * plot_height
+
+    draw_text(draw, (width // 2, 42), f"ERCOT Power Daily Average - {month_label}", font_title, "#24272d", anchor="ma")
+    subtitle_parts = []
+    if latest_da:
+        subtitle_parts.append(f"DA through {latest_da.date:%b %d}")
+    if latest_rt:
+        subtitle_parts.append(f"RT through {latest_rt.date:%b %d}")
+    subtitle = "; ".join(subtitle_parts) or "No DA/RT values returned from sheet"
+    draw_text(draw, (plot_left, 98), f"DAM and RTM daily averages from Google Sheet power tab. {subtitle}.", font_body, "#4b5563")
+    draw_text(draw, (plot_right, 58), APP_VERSION, font_small, "#9b9892", anchor="ra")
+
+    legend_x, legend_y = plot_right - 410, 132
+    draw.rounded_rectangle((legend_x, legend_y, legend_x + 400, legend_y + 48), radius=8, fill="#ffffff", outline="#d4d0c8", width=2)
+    draw.line((legend_x + 18, legend_y + 24, legend_x + 60, legend_y + 24), fill="#1e3a5f", width=6)
+    draw.ellipse((legend_x + 34, legend_y + 18, legend_x + 46, legend_y + 30), fill="#1e3a5f")
+    draw_text(draw, (legend_x + 74, legend_y + 10), "DA Daily Avg", font_legend, "#24272d")
+    draw.line((legend_x + 225, legend_y + 24, legend_x + 267, legend_y + 24), fill="#c75000", width=6)
+    draw.ellipse((legend_x + 241, legend_y + 18, legend_x + 253, legend_y + 30), fill="#c75000")
+    draw_text(draw, (legend_x + 281, legend_y + 10), "RT Daily Avg", font_legend, "#24272d")
+
+    for index, date in enumerate(dates):
+        if date.weekday() >= 5 or date in holidays:
+            day_width = plot_width / max(len(dates) - 1, 1)
+            left = int(x_for(index) - day_width / 2)
+            right = int(x_for(index) + day_width / 2)
+            draw.rectangle((max(plot_left, left), plot_top, min(plot_right, right), plot_bottom), fill="#e5e7eb")
+
+    for step in range(6):
+        y = plot_bottom - step * plot_height / 5
+        value = value_min + step * (value_max - value_min) / 5
+        draw.line((plot_left, y, plot_right, y), fill="#d7dde5", width=1)
+        draw_text(draw, (plot_left - 18, int(y)), f"{value:.0f}", font_axis, "#1f2937", anchor="rm")
+
+    tick_positions = list(range(0, len(dates), 2))
+    if (len(dates) - 1) not in tick_positions:
+        tick_positions.append(len(dates) - 1)
+    for index in tick_positions:
+        x = x_for(index)
+        draw.line((x, plot_top, x, plot_bottom), fill="#e1e7ef", width=1)
+        draw_text(draw, (int(x), plot_bottom + 30), dates[index].strftime("%b %d"), font_axis, "#1f2937", anchor="mm")
+
+    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill="#c7ccd4", width=2)
+    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill="#c7ccd4", width=2)
+
+    def draw_series(values: list[float | None], color: str) -> None:
+        prev: tuple[float, float] | None = None
+        for index, value in enumerate(values):
+            if value is None:
+                prev = None
+                continue
+            point = (x_for(index), y_for(value))
+            if prev is not None:
+                draw.line((*prev, *point), fill=color, width=6)
+            x, y = point
+            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color, outline=color)
+            prev = point
+
+    draw_series(dam, "#1e3a5f")
+    draw_series(rtm, "#c75000")
+
+    if latest_da and latest_da.dam_avg is not None:
+        x = x_for(dates.index(latest_da.date))
+        y = y_for(latest_da.dam_avg)
+        draw_text(draw, (int(x + 14), int(y - 34)), f"DA {latest_da.dam_avg:.2f}", font_label_bold, "#1e3a5f")
+    if latest_rt and latest_rt.rtm_avg is not None:
+        x = x_for(dates.index(latest_rt.date))
+        y = y_for(latest_rt.rtm_avg)
+        draw_text(draw, (int(x + 14), int(y + 10)), f"RT {latest_rt.rtm_avg:.2f}", font_label_bold, "#c75000")
+
+    draw_text(draw, (plot_left - 72, (plot_top + plot_bottom) // 2), "$/MWh", font_body, "#24272d", anchor="mm")
+    draw_text(draw, ((plot_left + plot_right) // 2, height - 36), "Price date", font_body, "#24272d", anchor="mm")
+
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": APP_TITLE, "version": APP_VERSION, "chart": "/chart.png?month=current", "health": "/health"}
+    return {
+        "service": APP_TITLE,
+        "version": APP_VERSION,
+        "gas_chart": "/chart.png?month=current",
+        "power_chart": "/power-chart.png?month=current",
+        "health": "/health",
+    }
 
 
 @app.get("/health")
@@ -561,6 +823,11 @@ def version() -> dict[str, str]:
 @app.get("/debug-sheet")
 def debug_sheet() -> JSONResponse:
     return JSONResponse(fetch_sheet_preview())
+
+
+@app.get("/debug-power-sheet")
+def debug_power_sheet() -> JSONResponse:
+    return JSONResponse(fetch_power_preview())
 
 
 @app.get("/chart-info")
@@ -581,6 +848,28 @@ def chart_info(month: str | None = Query(default="current")) -> JSONResponse:
             "latest_katy_price": latest_katy[1] if latest_katy else None,
             "lds_date": lds.price_date.isoformat() if lds else None,
             "lds_price": lds.nymex_price if lds else None,
+        }
+    )
+
+
+@app.get("/power-chart-info")
+def power_chart_info(month: str | None = Query(default="current")) -> JSONResponse:
+    rows = fetch_power_rows()
+    selected_month = choose_power_month(rows, month)
+    daily_rows = power_daily_rows(rows, selected_month)
+    latest_da = next((row for row in reversed(daily_rows) if row.dam_avg is not None), None)
+    latest_rt = next((row for row in reversed(daily_rows) if row.rtm_avg is not None), None)
+    return JSONResponse(
+        {
+            "month": selected_month,
+            "hourly_row_count": len(rows),
+            "calendar_row_count": len(daily_rows),
+            "da_day_count": sum(1 for row in daily_rows if row.dam_avg is not None),
+            "rt_day_count": sum(1 for row in daily_rows if row.rtm_avg is not None),
+            "latest_da_date": latest_da.date.isoformat() if latest_da else None,
+            "latest_da_avg": latest_da.dam_avg if latest_da else None,
+            "latest_rt_date": latest_rt.date.isoformat() if latest_rt else None,
+            "latest_rt_avg": latest_rt.rtm_avg if latest_rt else None,
         }
     )
 
@@ -615,6 +904,32 @@ def chart_check(month: str | None = Query(default="current")) -> JSONResponse:
     )
 
 
+@app.get("/power-chart-check")
+def power_chart_check(month: str | None = Query(default="current")) -> JSONResponse:
+    rows = fetch_power_rows()
+    selected_month = choose_power_month(rows, month)
+    daily_rows = power_daily_rows(rows, selected_month)
+    try:
+        render_power_chart(daily_rows, selected_month)
+        render_status = "ok"
+        render_error = None
+    except Exception as exc:
+        render_status = "error"
+        render_error = f"{type(exc).__name__}: {exc}"
+
+    return JSONResponse(
+        {
+            "month": selected_month,
+            "hourly_row_count": len(rows),
+            "calendar_row_count": len(daily_rows),
+            "da_day_count": sum(1 for row in daily_rows if row.dam_avg is not None),
+            "rt_day_count": sum(1 for row in daily_rows if row.rtm_avg is not None),
+            "render_status": render_status,
+            "render_error": render_error,
+        }
+    )
+
+
 @app.get("/chart.png")
 def chart_png(month: str | None = Query(default="current")) -> Response:
     rows = fetch_sheet_rows()
@@ -630,6 +945,28 @@ def chart_png(month: str | None = Query(default="current")) -> Response:
             detail=f"Chart rendering failed: {type(exc).__name__}: {exc}",
         ) from exc
     filename = f"lai-gas-price-trend-{selected_month}.png"
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@app.get("/power-chart.png")
+def power_chart_png(month: str | None = Query(default="current")) -> Response:
+    rows = fetch_power_rows()
+    selected_month = choose_power_month(rows, month)
+    daily_rows = power_daily_rows(rows, selected_month)
+    try:
+        png = render_power_chart(daily_rows, selected_month)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Power chart rendering failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    filename = f"lai-ercot-power-daily-average-{selected_month}.png"
     return Response(
         content=png,
         media_type="image/png",
