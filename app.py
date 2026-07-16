@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 APP_TITLE = "LAI Gas Chart API"
-APP_VERSION = "2026-07-12-split-panels-v8"
+APP_VERSION = "2026-07-15-split-panels-v9"
 
 
 def load_central_timezone() -> dt.tzinfo:
@@ -320,7 +320,7 @@ def power_daily_rows(rows: list[PowerHourlyRow], month: str) -> list[PowerDailyR
     today = dt.datetime.now(CENTRAL_TZ).date()
     grouped: dict[dt.date, list[PowerHourlyRow]] = {}
     for row in rows:
-        if start <= row.date < end and row.date < today:
+        if start <= row.date < end and row.date <= today:
             grouped.setdefault(row.date, []).append(row)
 
     result: list[PowerDailyRow] = []
